@@ -272,7 +272,7 @@ if command -v ccache >/dev/null 2>&1; then use_ccache=ON; info "ccache"; else us
 configure=(
   -S "$root" -B "$build_dir" -G Ninja
   "-DCMAKE_BUILD_TYPE=$config"
-  "-DBUILD_TESTING=$tests" "-DLICHII_TESTS=$tests" "-DDYNARMIC_TESTS=$tests"
+  "-DBUILD_TESTING=$tests" "-DLICHII_TESTS=$tests"
   -DLICHII_CMD=ON -DLICHII_ROOM=OFF -DLICHII_ROOM_STANDALONE=OFF
   -DLICHII_USE_BUNDLED_QT=OFF -DENABLE_QT_TRANSLATION=ON
   "-DCMAKE_PREFIX_PATH=$qt" "-DQt6_DIR=$qt/lib/cmake/Qt6"

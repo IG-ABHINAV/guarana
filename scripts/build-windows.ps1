@@ -20,8 +20,8 @@ script says how to install them.
 Release (default) or Debug. Debug has no ThinLTO and no PGO and builds in build\debug.
 
 .PARAMETER Tests
-Also configures the unit tests (BUILD_TESTING, LICHII_TESTS, DYNARMIC_TESTS) and builds every
-target. scripts\run-tests.ps1 builds and runs them in their own tree, as CI does.
+Also configures the unit tests (BUILD_TESTING and LICHII_TESTS) and builds every target.
+scripts\run-tests.ps1 builds and runs them in their own tree, as CI does.
 
 .PARAMETER NoPgo
 Leaves out -fprofile-use=lichii-windows.profdata. Builds in build\release-nopgo.
@@ -529,7 +529,7 @@ try {
         '-C', (ConvertTo-Slash $initCache),
         '-S', (ConvertTo-Slash $Root), '-B', (ConvertTo-Slash $Build), '-G', 'Ninja',
         "-DCMAKE_BUILD_TYPE=$Config",
-        "-DBUILD_TESTING=$onOff", "-DLICHII_TESTS=$onOff", "-DDYNARMIC_TESTS=$onOff",
+        "-DBUILD_TESTING=$onOff", "-DLICHII_TESTS=$onOff",
         '-DLICHII_CMD=ON', '-DLICHII_ROOM=OFF', '-DLICHII_ROOM_STANDALONE=OFF',
         '-DLICHII_USE_BUNDLED_QT=OFF', '-DENABLE_QT_TRANSLATION=ON', '-DLICHII_USE_BUNDLED_SDL3=ON',
         '-DENABLE_UPDATE_CHECKER=OFF', '-DUSE_DISCORD_PRESENCE=OFF',
