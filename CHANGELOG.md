@@ -10,6 +10,10 @@ Upstream pull request numbers refer to [Lichii](https://github.com/zortos293/Lic
 
 ## [Unreleased]
 
+### Documentation
+
+- `docs/switches.md`: a row for each of the 13 switches `dist/nx2_switches.txt` names or sets (#37).
+
 ## [20.0.0]
 
 The first Guarana release: upstream Lichii `nx2` at `e633e165f7`, ten upstream pull requests merged
