@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <algorithm>
+#include <cstdlib>
 #include <cmath>
 #include <string>
 #include <vector>
@@ -11,6 +12,7 @@
 #include "common/fs/path_util.h"
 #include "common/logging.h"
 #include "common/settings.h"
+#include "video_core/frame_budget.h"
 #include "video_core/frame_gen_choice.h"
 #include "video_core/renderer_vulkan/present/frame_gen.h"
 #include "video_core/renderer_vulkan/present/util.h"
@@ -30,6 +32,26 @@ namespace {
 constexpr size_t COLOR_CHANNELS = 4;
 constexpr u64 LSFG_REQUIRED_FRAMES = 2;
 constexpr u32 LSFG_RECURRENCE_FRAMES = 2;
+constexpr u64 EXTRAPOLATION_LOG_INTERVAL = 600;
+
+/// EDEN_NX2_CADENCE: with extrapolated frames, hold real frames to an even share of the target
+/// rate so that every shown frame lasts the same time. 1 chooses the share (60, 30, 20 or 15 real
+/// frames for a target of 60) from what the game sustains; 2 to 4 fix the divisor.
+[[nodiscard]] u32 CadenceSetting() {
+    static const u32 setting = [] {
+        const char* value = std::getenv("EDEN_NX2_CADENCE");
+        return value ? static_cast<u32>(std::strtoul(value, nullptr, 10)) : 0U;
+    }();
+    return setting;
+}
+
+constexpr u32 CADENCE_MAX_DIVISOR = 4;
+
+[[nodiscard]] f32 CadenceTargetRate() {
+    const u32 rate = Settings::values.frame_gen_target_rate.GetValue();
+    return rate != 0 ? static_cast<f32>(rate) : 60.0f;
+}
+
 constexpr auto ACTIVITY_LOG_INTERVAL = std::chrono::seconds(10);
 
 [[nodiscard]] std::string ModeText(Settings::FrameGenType active) {
@@ -250,7 +272,71 @@ void CopyPresentedFrame(vk::CommandBuffer cmdbuf, VkImage source, LsfgImage& des
 FrameGen::FrameGen(MemoryAllocator& memory_allocator_, Scheduler& scheduler_)
     : memory_allocator{memory_allocator_}, scheduler{scheduler_} {}
 
-FrameGen::~FrameGen() = default;
+FrameGen::~FrameGen() {
+    ReleaseCadence();
+}
+
+void FrameGen::SetExtrapolationSource(const std::optional<ExtrapolationSource>& source,
+                                      VkRect2D screen) {
+    extrapolation_source = source;
+    extrapolation_screen = screen;
+    if (source && !extrapolating) {
+        LOG_INFO(Render_Vulkan, "Frame generation: extrapolating from the game's motion vectors");
+        extrapolating = true;
+    }
+}
+
+void FrameGen::ProcessExtrapolated(const Device& device, Frame* frame, VkFormat format) {
+    if (chain || fsr3_chain) {
+        scheduler.Finish();
+        chain.reset();
+        fsr3_chain.reset();
+    }
+    frame_count = 0;
+    warm_streak = 0;
+    extrapolation_frame = frame;
+
+    if (!frame->storage_view) {
+        ReleaseCadence();
+        SetState(VideoCore::FrameGenState::UnsupportedSurface, format);
+        return;
+    }
+    SetState(VideoCore::FrameGenState::Running, format);
+
+    if (!extrapolation) {
+        extrapolation.emplace(device);
+    }
+
+    // Without motion or across a camera cut the real frame is shown alone.
+    const bool usable = extrapolation_source && !extrapolation_source->cut &&
+                        extrapolation_screen.extent.width != 0 &&
+                        extrapolation_screen.extent.height != 0;
+    extrapolation_missing += extrapolation_source ? 0 : 1;
+    extrapolation_cuts += extrapolation_source && extrapolation_source->cut ? 1 : 0;
+    // A cadence holds real frames only while frames are predicted: menus and cut scenes without
+    // motion data run at the game's own rate.
+    unusable_streak = usable ? 0 : unusable_streak + 1;
+    if (usable) {
+        UpdateCadence();
+    } else if (unusable_streak > 30) {
+        ReleaseCadence();
+    }
+
+    last_generations = plan.generations;
+    generated = usable && plan.warm && plan.generations > 0;
+    generated_frames.fetch_add(GeneratedFrameCount(), std::memory_order_relaxed);
+
+    if (++extrapolation_frames % EXTRAPOLATION_LOG_INTERVAL == 0) {
+        LOG_INFO(Render_Vulkan,
+                 "Frame extrapolation: {} frames, {} without motion, {} camera cuts, {} planned "
+                 "per frame, HUD kept {}",
+                 EXTRAPOLATION_LOG_INTERVAL, extrapolation_missing, extrapolation_cuts,
+                 plan.generations,
+                 extrapolation_source && extrapolation_source->hud_reference != VK_NULL_HANDLE);
+        extrapolation_missing = 0;
+        extrapolation_cuts = 0;
+    }
+}
 
 void FrameGen::Process(const Device& device, Frame* frame, VkFormat format,
                        VkExtent2D guest_extent) {
@@ -265,6 +351,13 @@ void FrameGen::Process(const Device& device, Frame* frame, VkFormat format,
         shaders.emplace(device);
     }
     unavailable = type == Settings::FrameGenType::Lsfg && !shaders->IsValid();
+
+    if (extrapolating && Settings::values.frame_gen.GetValue()) {
+        // Extrapolation needs neither Lossless Scaling shaders nor an interpolation chain.
+        unavailable = false;
+        ProcessExtrapolated(device, frame, format);
+        return;
+    }
 
     const bool nvidia_frame_gen = type == Settings::FrameGenType::NvidiaDlssG;
     if (unavailable || !Settings::values.frame_gen.GetValue() || nvidia_frame_gen) {
@@ -284,6 +377,7 @@ void FrameGen::Process(const Device& device, Frame* frame, VkFormat format,
                                                   : VideoCore::FrameGenState::UnsupportedGpu,
                      format);
         }
+        ReleaseCadence();
         return;
     }
 
@@ -338,6 +432,18 @@ void FrameGen::Process(const Device& device, Frame* frame, VkFormat format,
             dumped = true;
         }
     }
+}
+
+void FrameGen::Pause() {
+    pacer.Reset();
+    plan = {};
+    frame_count = 0;
+    last_count = 0;
+    last_generations = 0;
+    warm_streak = 0;
+    generated = false;
+    extrapolation_source.reset();
+    ReleaseCadence();
 }
 
 void FrameGen::SetState(VideoCore::FrameGenState new_state, VkFormat format) {
@@ -429,7 +535,82 @@ size_t FrameGen::WantedGenerations(size_t capacity,
         return 0;
     }
     plan = pacer.Plan(capacity, blocked);
+    if (extrapolating && cadence_divisor != 0) {
+        // Extrapolated frames cost next to nothing: always fill the cadence.
+        plan = {.generations = std::min<size_t>(capacity, cadence_divisor - 1), .warm = true};
+    }
     return plan.generations;
+}
+
+std::chrono::nanoseconds FrameGen::CadenceSpacing() const {
+    if (!extrapolating || !generated || last_generations == 0 || cadence_divisor == 0) {
+        return {};
+    }
+    return std::chrono::nanoseconds{static_cast<s64>(1.0e9 / CadenceTargetRate())};
+}
+
+void FrameGen::ReleaseCadence() {
+    if (cadence_divisor == 0) {
+        return;
+    }
+    LOG_INFO(Render_Vulkan, "Frame cadence: off, frame budget target back to {:.0f} FPS",
+             cadence_saved_target);
+    cadence_divisor = 0;
+    cadence_slow_checks = 0;
+    cadence_fast_checks = 0;
+    VideoCore::FrameBudget::SetTargetFps(cadence_saved_target);
+}
+
+void FrameGen::UpdateCadence() {
+    const u32 setting = CadenceSetting();
+    if (setting == 0) {
+        return;
+    }
+    const f32 target = CadenceTargetRate();
+    const auto apply = [this, target](u32 divisor, const char* reason) {
+        if (divisor == cadence_divisor) {
+            return;
+        }
+        if (cadence_divisor == 0) {
+            cadence_saved_target = VideoCore::FrameBudget::TargetFps();
+        }
+        LOG_INFO(Render_Vulkan,
+                 "Frame cadence: {:.0f} real frames shown as {:.0f} ({}), was {:.0f}",
+                 target / static_cast<f32>(divisor), target, reason,
+                 cadence_divisor != 0 ? target / static_cast<f32>(cadence_divisor) : 0.0f);
+        cadence_divisor = divisor;
+        cadence_slow_checks = 0;
+        cadence_fast_checks = 0;
+        VideoCore::FrameBudget::SetTargetFps(target / static_cast<f32>(divisor));
+    };
+    if (setting >= 2) {
+        apply(std::min(setting, CADENCE_MAX_DIVISOR), "fixed");
+        return;
+    }
+    if (cadence_divisor == 0) {
+        apply(3, "start");
+        return;
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (now - cadence_checked < std::chrono::milliseconds{500}) {
+        return;
+    }
+    cadence_checked = now;
+    // What four in five frames took without the pacing wait, 0 while unknown.
+    const f64 work_ms = VideoCore::FrameBudget::RecentWorkMs();
+    if (work_ms <= 0.0) {
+        return;
+    }
+    const f64 budget_ms = 1000.0 * cadence_divisor / target;
+    const f64 faster_ms = 1000.0 * (cadence_divisor - 1) / target;
+    cadence_slow_checks = work_ms > budget_ms * 1.03 ? cadence_slow_checks + 1 : 0;
+    cadence_fast_checks =
+        cadence_divisor > 1 && work_ms < faster_ms * 0.90 ? cadence_fast_checks + 1 : 0;
+    if (cadence_slow_checks >= 3 && cadence_divisor < CADENCE_MAX_DIVISOR) {
+        apply(cadence_divisor + 1, "the frames take longer");
+    } else if (cadence_fast_checks >= 8) {
+        apply(cadence_divisor - 1, "the frames leave room");
+    }
 }
 
 size_t FrameGen::GeneratedFrameCount() const {
@@ -437,6 +618,23 @@ size_t FrameGen::GeneratedFrameCount() const {
 }
 
 void FrameGen::GenerateInto(const Device& device, Frame* destination, size_t generation) {
+    if (extrapolating) {
+        if (!extrapolation || !extrapolation_source || !extrapolation_frame ||
+            !destination->storage_view) {
+            return;
+        }
+        const f32 advance =
+            static_cast<f32>(generation + 1) / static_cast<f32>(last_generations + 1);
+        const VkExtent2D extent{.width = destination->width, .height = destination->height};
+
+        scheduler.RequestOutsideRenderPassOperationContext();
+        // The storage view has the image's own format, so reads and writes encode alike.
+        extrapolation->Generate(device, scheduler, *extrapolation_source,
+                                *extrapolation_frame->storage_view, *destination->image,
+                                *destination->storage_view, extent, extrapolation_screen, advance);
+        return;
+    }
+
     const bool use_fsr3 = built_type == Settings::FrameGenType::Fsr3;
 
     if (use_fsr3 && fsr3_chain) {

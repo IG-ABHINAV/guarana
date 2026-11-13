@@ -47,6 +47,9 @@ struct Profile {
     bool support_demote_to_helper_invocation{};
     bool support_int64_atomics{};
     bool support_shared_int64_atomics{};
+    /// Storage buffer float32 atomic add in hardware (VK_EXT_shader_atomic_float), not a
+    /// compare-exchange loop.
+    bool support_float32_atomic_add{};
     bool support_derivative_control{};
     bool support_geometry_shader_passthrough{};
     bool support_native_ndc{};
@@ -66,6 +69,9 @@ struct Profile {
     bool support_storage_texel_buffer_array_nonuniform_indexing{};
 
     bool warp_size_potentially_larger_than_guest{};
+    /// Some stages may run in subgroups narrower than the guest's 32 lanes (Intel's SIMD8/16
+    /// fragment and vertex shaders): shuffles from lanes past the subgroup are kept in bounds.
+    bool warp_size_potentially_smaller_than_guest{};
 
     bool lower_left_origin_mode{};
     /// Fragment outputs have to be declared even if they are not written to avoid undefined values.
@@ -110,7 +116,24 @@ struct Profile {
     bool support_cooperative_hmma{};
     /// Without the above, HMMA runs on 16x16x16 cooperative matrices through shared memory
     bool support_cooperative_hmma_16x16x16{};
+    /// Software HMMA gathers its operands from a subgroup's scratch in shared memory instead of
+    /// shuffling them; the pipeline gets full subgroups of the guest's 32 lanes
+    bool support_software_matrix_shared_memory{};
+    /// Experiment: the above without its subgroup barriers (a subgroup's lanes run in lockstep)
+    bool software_matrix_shared_memory_no_barrier{};
+    /// Experiment: its loads are single words, also where the shared memory has a vector view
+    bool software_matrix_shared_memory_scalar_loads{};
     u32 max_subgroup_size{};
+    /// Experiment (EDEN_NX2_MESH_CULL): culling added to native mesh programs, MESH_CULL_* bits
+    u32 mesh_cull{};
+    /// EDEN_NX2_TASK_DENSITY: percent of the mesh workgroups a native task program asks for.
+    u32 mesh_task_percent{100};
+    /// Experiment (EDEN_NX2_MESH_OUT): cheaper native mesh program outputs, MESH_OUT_* bits, and
+    /// the bounding box size in pixels under which MESH_OUT_RATE shades a triangle 2x2
+    u32 mesh_out{};
+    f32 mesh_rate_pixels{4.0f};
+    /// Experiment (EDEN_NX2_GM): cheaper run-time routing of global memory accesses, GM_* bits
+    u32 global_memory_opt{};
 
     u32 gl_max_compute_smem_size{};
 

@@ -8,6 +8,7 @@
 #include <array>
 #include <atomic>
 #include <cstdlib>
+#include <functional>
 #include <mutex>
 #include <optional>
 #include <set>
@@ -75,10 +76,12 @@ VK_DEFINE_HANDLE(VmaPool)
             primitive_topology_list_restart)                                                       \
     FEATURE(EXT, ProvokingVertex, PROVOKING_VERTEX, provoking_vertex)                              \
     FEATURE(EXT, Robustness2, ROBUSTNESS_2, robustness2)                                           \
+    FEATURE(EXT, ShaderAtomicFloat, SHADER_ATOMIC_FLOAT, shader_atomic_float)                      \
     FEATURE(EXT, ShaderFloat8, SHADER_FLOAT8, shader_float8)                                       \
     FEATURE(EXT, TransformFeedback, TRANSFORM_FEEDBACK, transform_feedback)                        \
     FEATURE(EXT, VertexInputDynamicState, VERTEX_INPUT_DYNAMIC_STATE, vertex_input_dynamic_state)  \
     FEATURE(KHR, CooperativeMatrix, COOPERATIVE_MATRIX, cooperative_matrix)                        \
+    FEATURE(KHR, FragmentShadingRate, FRAGMENT_SHADING_RATE, fragment_shading_rate)                \
     FEATURE(NV, CooperativeMatrix2, COOPERATIVE_MATRIX_2, cooperative_matrix2)                     \
     FEATURE(KHR, Maintenance5, MAINTENANCE_5, maintenance5)                                        \
     FEATURE(KHR, Maintenance6, MAINTENANCE_6, maintenance6)                                        \
@@ -240,8 +243,11 @@ enum class NvidiaArchitecture {
 /// Handles data specific to a physical device.
 class Device {
 public:
+    /// on_capabilities runs once the device's capabilities are known, before any setting that
+    /// sizes the device (vram_usage_mode) is read.
     explicit Device(VkInstance instance, vk::PhysicalDevice physical, VkSurfaceKHR surface,
-                    const vk::InstanceDispatch& dld);
+                    const vk::InstanceDispatch& dld,
+                    const std::function<void(const Device&)>& on_capabilities = {});
     ~Device();
 
     /**
@@ -571,6 +577,21 @@ FN_MAX_LIMIT_LIST
         return properties.subgroup_size_control.requiredSubgroupSizeStages & stage;
     }
 
+    /// Returns true if compute pipelines can require full subgroups.
+    bool IsComputeFullSubgroupsSupported() const {
+        return extensions.subgroup_size_control &&
+               features.subgroup_size_control.computeFullSubgroups;
+    }
+
+    /// Returns true if a stage may run in subgroups narrower than the guest's warp (Intel runs
+    /// fragment and vertex shaders SIMD8 or SIMD16, and those cannot be given a size).
+    bool IsWarpSizePotentiallySmallerThanGuest() const {
+        const u32 min_size = extensions.subgroup_size_control
+                                 ? properties.subgroup_size_control.minSubgroupSize
+                                 : properties.subgroup_properties.subgroupSize;
+        return min_size != 0 && min_size < GuestWarpSize;
+    }
+
     /// Returns true if the device supports the provided subgroup feature.
     bool IsSubgroupFeatureSupported(VkSubgroupFeatureFlagBits feature) const {
         return properties.subgroup_properties.supportedOperations & feature;
@@ -739,6 +760,33 @@ FN_MAX_LIMIT_LIST
         return extensions.mesh_shader && features.mesh_shader.taskShader &&
                features.mesh_shader.meshShader;
     }
+
+    /// Returns true if per-draw shading rates are in use (VK_KHR_fragment_shading_rate with
+    /// EDEN_NX2_VRS set): every guest graphics pipeline then has the rate as dynamic state.
+    bool IsKhrFragmentShadingRateSupported() const {
+        return extensions.fragment_shading_rate &&
+               features.fragment_shading_rate.pipelineFragmentShadingRate;
+    }
+
+    /// Returns true if native mesh programs may write PrimitiveShadingRateKHR (EDEN_NX2_VRS and
+    /// EDEN_NX2_MESH_OUT bit 2). Guest pipelines have several viewports, so it needs that limit.
+    bool IsMeshPrimitiveShadingRateSupported() const {
+        return IsKhrFragmentShadingRateSupported() && IsExtMeshShaderSupported() &&
+               features.fragment_shading_rate.primitiveFragmentShadingRate &&
+               features.mesh_shader.primitiveFragmentShadingRateMeshShader &&
+               properties.fragment_shading_rate.primitiveFragmentShadingRateWithMultipleViewports;
+    }
+
+    /// Returns how a mesh program's per-primitive rate combines with the per-draw one: the
+    /// coarser of the two where the device can, else the primitive's.
+    VkFragmentShadingRateCombinerOpKHR MeshPrimitiveRateCombiner() const {
+        return properties.fragment_shading_rate.fragmentShadingRateNonTrivialCombinerOps
+                   ? VK_FRAGMENT_SHADING_RATE_COMBINER_OP_MAX_KHR
+                   : VK_FRAGMENT_SHADING_RATE_COMBINER_OP_REPLACE_KHR;
+    }
+
+    /// Returns the largest supported fragment size that fits in the wanted one.
+    VkExtent2D ClampFragmentShadingRate(VkExtent2D wanted) const;
 
     /// Returns true if the device supports VK_KHR_image_format_list.
     bool IsKhrImageFormatListSupported() const {
@@ -1027,6 +1075,12 @@ FN_MAX_LIMIT_LIST
                features.shader_atomic_int64.shaderSharedInt64Atomics;
     }
 
+    /// Returns true if storage buffer float32 atomic add runs in hardware (VK_EXT_shader_atomic_float).
+    bool IsFloat32AtomicAddSupported() const {
+        return extensions.shader_atomic_float &&
+               features.shader_atomic_float.shaderBufferFloat32AtomicAdd;
+    }
+
     bool IsExtConditionalRendering() const {
         return extensions.conditional_rendering;
     }
@@ -1095,6 +1149,12 @@ FN_MAX_LIMIT_LIST
 
     u64 GetDeviceLocalMemory() const {
         return device_access_memory;
+    }
+
+    /// Size of the largest device-local heap (with EDEN_NX2_VRAM_LIMIT_MIB applied). Unlike
+    /// GetDeviceLocalMemory() this is the card's memory, not a budget with a reserve taken off.
+    u64 GetDeviceLocalHeapSize() const {
+        return main_heap_size;
     }
 
     bool CanReportMemoryUsage() const {
@@ -1381,6 +1441,7 @@ private:
         VkPhysicalDeviceDepthStencilResolveProperties depth_stencil_resolve{};
         VkPhysicalDeviceCustomBorderColorPropertiesEXT custom_border_color{};
         VkPhysicalDeviceCooperativeMatrixPropertiesKHR cooperative_matrix{};
+        VkPhysicalDeviceFragmentShadingRatePropertiesKHR fragment_shading_rate{};
         VkPhysicalDeviceShaderIntegerDotProductProperties integer_dot_product{};
 
         VkPhysicalDeviceProperties properties{};
@@ -1393,6 +1454,7 @@ private:
     VkPhysicalDeviceFeatures2 features2{};
     VkPhysicalDeviceFaultFeaturesEXT device_fault_features{};
     VkPhysicalDeviceProperties2 properties2{};
+    std::vector<VkExtent2D> fragment_shading_rates; ///< Supported fragment sizes (EDEN_NX2_VRS).
 
     // Misc features
     bool is_optimal_astc_supported{};          ///< Support for all guest ASTC formats.
@@ -1439,6 +1501,7 @@ private:
     std::vector<size_t> valid_heap_memory;                   ///< Heaps used.
     size_t main_heap{};       ///< Largest device-local heap, where images live.
     u64 heap_size_limit{};    ///< EDEN_NX2_VRAM_LIMIT_MIB for device-local heaps, 0 if unset.
+    u64 main_heap_size{};     ///< Size of main_heap, with heap_size_limit applied.
 
     /// Format properties dictionary.
     ::Common::unordered_map<VkFormat, VkFormatProperties> format_properties;

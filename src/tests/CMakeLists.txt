@@ -22,11 +22,13 @@ add_executable(tests
     core/nx2_streamplay.cpp
     core/nx2_video_ready.cpp
     core/nx2_thread_stats.cpp
+    core/general_channel.cpp
     core/nx2_debug_server.cpp
     core/nx2_present_pacer.cpp
     core/nx2_frame_interval.cpp
     core/ldn_lan_protocol.cpp
     core/perf_stats.cpp
+    core/game_presets.cpp
     core/key_derivation.cpp
     common/display_hdr.cpp
     common/dkb_cpu_trace.cpp
@@ -78,11 +80,16 @@ add_executable(tests
     video_core/maxwell_numeric.cpp
     video_core/maxwell_permute_lod.cpp
     video_core/submission_policy.cpp
+    video_core/cost_governor.cpp
+    video_core/frame_budget.cpp
+    video_core/auto_shading_rate.cpp
+    common/power_governor.cpp
     video_core/native_pending_policy.cpp
     video_core/framebuffer_clear_layers.cpp
     video_core/framebuffer_limits.cpp
     video_core/unbacked_fallback.cpp
     video_core/eviction_age.cpp
+    video_core/stale_targets.cpp
     video_core/host_memory_limit.cpp
     video_core/fire_emblem_upscale.cpp
     video_core/dlss_contract.cpp
@@ -98,6 +105,7 @@ add_executable(tests
     video_core/oot_network.cpp
     video_core/page_filter.cpp
     video_core/query_stream.cpp
+    video_core/pipeline_cache_policy.cpp
     video_core/pipeline_optimization.cpp
     video_core/spirv_atomic_retry.cpp
     video_core/spirv_storage_alignment.cpp
@@ -224,6 +232,7 @@ add_executable(tests
     video_core/usage_tracker.cpp
     video_core/shader_invalidation.cpp
     video_core/descriptor_table.cpp
+    video_core/draw_template.cpp
     video_core/descriptor_payload_growth.cpp
     video_core/global_address_tracking.cpp
     video_core/global_atomic_routing.cpp

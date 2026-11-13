@@ -101,6 +101,7 @@ void Load(VkDevice device, DeviceDispatch& dld) noexcept {
     X(vkCmdBlitImage);
     X(vkCmdClearAttachments);
     X(vkCmdClearColorImage);
+    X(vkCmdClearDepthStencilImage);
     X(vkCmdCopyBuffer);
     X(vkCmdCopyBufferToImage);
     X(vkCmdCopyImage);
@@ -128,6 +129,7 @@ void Load(VkDevice device, DeviceDispatch& dld) noexcept {
     X(vkCmdPushDescriptorSetWithTemplateKHR);
     X(vkCmdSetBlendConstants);
     X(vkCmdSetDepthBias);
+    X(vkCmdSetFragmentShadingRateKHR);
     X(vkCmdSetDepthBias2EXT);
     X(vkCmdSetDepthBounds);
     X(vkCmdSetEvent);
@@ -235,6 +237,7 @@ void Load(VkDevice device, DeviceDispatch& dld) noexcept {
     X(vkGetPipelineBinaryDataKHR);
     X(vkReleaseCapturedPipelineDataKHR);
     X(vkGetPipelineExecutableStatisticsKHR);
+    X(vkGetPipelineExecutableInternalRepresentationsKHR);
     X(vkGetSemaphoreCounterValue);
     X(vkMapMemory);
     X(vkQueueBindSparse);
@@ -323,6 +326,7 @@ bool Load(VkInstance instance, InstanceDispatch& dld) noexcept {
     X(vkDestroySurfaceKHR);
     X(vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR);
     X(vkGetPhysicalDeviceFeatures2);
+    X(vkGetPhysicalDeviceFragmentShadingRatesKHR);
     X(vkGetPhysicalDeviceFormatProperties2);
     X(vkGetPhysicalDeviceProperties2);
     X(vkGetPhysicalDeviceSurfaceCapabilitiesKHR);
@@ -935,6 +939,42 @@ std::vector<VkPipelineExecutableStatisticKHR> Device::GetPipelineExecutableStati
     return statistics;
 }
 
+std::vector<VkPipelineExecutableInternalRepresentationKHR>
+Device::GetPipelineExecutableInternalRepresentationsKHR(
+    VkPipeline pipeline, u32 executable_index, std::vector<std::vector<char>>& storage) const {
+    storage.clear();
+    if (!dld->vkGetPipelineExecutableInternalRepresentationsKHR) {
+        return {};
+    }
+    const VkPipelineExecutableInfoKHR executable_info{
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_INFO_KHR,
+        .pNext = nullptr,
+        .pipeline = pipeline,
+        .executableIndex = executable_index,
+    };
+    u32 num{};
+    dld->vkGetPipelineExecutableInternalRepresentationsKHR(handle, &executable_info, &num,
+                                                           nullptr);
+    std::vector<VkPipelineExecutableInternalRepresentationKHR> representations(num);
+    for (auto& representation : representations) {
+        representation.sType = VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_INTERNAL_REPRESENTATION_KHR;
+    }
+    // Without pData the driver writes each one's dataSize.
+    Check(dld->vkGetPipelineExecutableInternalRepresentationsKHR(handle, &executable_info, &num,
+                                                                 representations.data()));
+    representations.resize(num);
+    storage.resize(representations.size());
+    for (size_t index = 0; index < representations.size(); ++index) {
+        storage[index].resize(representations[index].dataSize);
+        representations[index].pData = storage[index].data();
+    }
+    // VK_INCOMPLETE leaves what fitted.
+    Filter(dld->vkGetPipelineExecutableInternalRepresentationsKHR(handle, &executable_info, &num,
+                                                                  representations.data()));
+    representations.resize(num);
+    return representations;
+}
+
 void Device::UpdateDescriptorSets(Span<VkWriteDescriptorSet> writes,
                                   Span<VkCopyDescriptorSet> copies) const noexcept {
     dld->vkUpdateDescriptorSets(handle, writes.size(), writes.data(), copies.size(), copies.data());
@@ -1034,6 +1074,29 @@ std::vector<VkCooperativeMatrixPropertiesKHR> PhysicalDevice::GetCooperativeMatr
     }
     properties.resize(num);
     return properties;
+}
+
+std::vector<VkPhysicalDeviceFragmentShadingRateKHR> PhysicalDevice::GetFragmentShadingRatesKHR()
+    const {
+    if (!dld->vkGetPhysicalDeviceFragmentShadingRatesKHR) {
+        return {};
+    }
+    u32 num = 0;
+    if (dld->vkGetPhysicalDeviceFragmentShadingRatesKHR(physical_device, &num, nullptr) !=
+        VK_SUCCESS) {
+        return {};
+    }
+    std::vector<VkPhysicalDeviceFragmentShadingRateKHR> rates(
+        num, VkPhysicalDeviceFragmentShadingRateKHR{
+                 .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADING_RATE_KHR,
+                 .pNext = nullptr,
+             });
+    if (dld->vkGetPhysicalDeviceFragmentShadingRatesKHR(physical_device, &num, rates.data()) !=
+        VK_SUCCESS) {
+        return {};
+    }
+    rates.resize(num);
+    return rates;
 }
 
 bool PhysicalDevice::GetSurfaceSupportKHR(u32 queue_family_index, VkSurfaceKHR surface) const {

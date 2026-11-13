@@ -12,6 +12,7 @@
 
 #include "common/assert.h"
 #include "common/dkb_cpu_trace.h"
+#include "common/power_tuning.h"
 #include "common/scope_exit.h"
 #include "common/settings.h"
 #include "common/thread.h"

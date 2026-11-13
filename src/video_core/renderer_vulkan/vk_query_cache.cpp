@@ -4,6 +4,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <cstddef>
+#include <cstdlib>
 #include <limits>
 #include <map>
 #include <memory>
@@ -280,8 +281,14 @@ public:
         // AMD's drivers wait on each query of a WAIT_BIT copy separately (3.8 us per query, ~5 ms
         // a frame in Ocarina). Queries complete in order on the queue, so waiting for the newest
         // one is enough before copying the range without the wait.
+        // EDEN_NX2_QUERY_WAIT_LAST=1: the same on Intel's Windows driver (experiment).
+        static const bool intel_wait_on_last = [] {
+            const char* value = std::getenv("EDEN_NX2_QUERY_WAIT_LAST");
+            return value && *value == '1';
+        }();
         const bool wait_on_last =
-            driver_id == VK_DRIVER_ID_AMD_PROPRIETARY || driver_id == VK_DRIVER_ID_AMD_OPEN_SOURCE;
+            driver_id == VK_DRIVER_ID_AMD_PROPRIETARY || driver_id == VK_DRIVER_ID_AMD_OPEN_SOURCE ||
+            (intel_wait_on_last && driver_id == VK_DRIVER_ID_INTEL_PROPRIETARY_WINDOWS);
 
         ApplyBanksWideOp<true>(pending_sync, [&](SamplesQueryBank* bank, size_t start,
                                                  size_t amount) {
@@ -289,7 +296,8 @@ public:
             auto& resolve_buffer = buffers[resolve_buffer_index];
             VkQueryPool query_pool = bank->GetInnerPool();
             scheduler.RequestOutsideRenderPassOperationContext();
-            scheduler.Record([start, amount, base_offset, query_pool, wait_on_last,
+            scheduler.RecordEmu(TraceCategory::QueryCopy, {static_cast<u32>(amount), 0, 0},
+                [start, amount, base_offset, query_pool, wait_on_last,
                               buffer = *resolve_buffer](vk::CommandBuffer cmdbuf) {
                 const VkBufferMemoryBarrier copy_query_pool_barrier{
                     .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
@@ -1513,6 +1521,9 @@ void QueryCacheRuntime::HostConditionalRenderingCompareValueImpl(VideoCommon::Lo
         const auto post_op = VideoCommon::ObtainBufferOperation::DoNothing;
         const auto [buffer, offset] =
             impl->buffer_cache.ObtainCPUBuffer(object.address, 8, sync_info, post_op);
+        // Later passes and submissions begin conditional rendering on this buffer again
+        // (ResumeHostConditionalRendering) without telling its usage tracker.
+        buffer->DisableDirectUploads();
         impl->hcr_buffer = buffer->Handle();
         impl->hcr_offset = offset;
     }
@@ -1819,7 +1830,8 @@ void QueryCacheRuntime::SyncValues(std::span<SyncValuesType> values, VkBuffer ba
     }
 
     impl->scheduler.RequestOutsideRenderPassOperationContext();
-    impl->scheduler.Record([src_buffer, dst_buffers = std::move(impl->buffers_to_upload_to), vk_copies = std::move(impl->copies_setup)](vk::CommandBuffer cmdbuf) {
+    impl->scheduler.RecordEmu(TraceCategory::QueryCopy, {0, 0, 1},
+        [src_buffer, dst_buffers = std::move(impl->buffers_to_upload_to), vk_copies = std::move(impl->copies_setup)](vk::CommandBuffer cmdbuf) {
         size_t size = dst_buffers.size();
         for (size_t i = 0; i < size; i++) {
             cmdbuf.CopyBuffer(src_buffer, dst_buffers[i].first, vk_copies[i]);

@@ -7,7 +7,10 @@
 
 #include <array>
 #include <bit>
+#include <map>
 #include <optional>
+#include <utility>
+#include <vector>
 
 #include <sirit/sirit.h>
 #include "common/container/unordered_map.h"
@@ -286,6 +289,9 @@ public:
     Id sample_id{};
     Id is_helper_invocation{};
     Id subgroup_local_invocation_id{};
+    /// SubgroupSize, when the host subgroup may be narrower than the guest warp and the program
+    /// shuffles (Profile::warp_size_potentially_smaller_than_guest).
+    Id subgroup_size{};
     Id subgroup_mask_eq{};
     Id subgroup_mask_lt{};
     Id subgroup_mask_le{};
@@ -366,6 +372,15 @@ public:
     };
     std::array<Id, static_cast<size_t>(GlobalAtomic::Count)> global_atomic_funcs{};
     Id atomic_cas_global_func_u32{};
+    /// GM_HOIST: per storage buffer descriptor, the private variable holding its base address
+    /// (stored by EmitGlobalMemoryPrologue); empty when the program is not hoisted.
+    std::vector<Id> global_bases;
+    const Info* global_bases_info{};
+    void EmitGlobalMemoryPrologue();
+    /// GM_NARROW: the load function for a word shift (2, 3, 4) and a LoadGlobal's flags, or an
+    /// invalid id when the load searches every buffer.
+    [[nodiscard]] Id NarrowGlobalLoad(u32 shift, u32 flags) const;
+    std::map<std::pair<u32, u32>, Id> narrow_load_funcs;
 
     bool need_input_position_indirect{};
     Id input_position{};
@@ -390,9 +405,14 @@ public:
     /// Set when HMMA runs on 16x16x16 matrices: each 32-lane subgroup owns 384 words of shared
     /// memory from this word (A, B and C/D tiles of 16x16 fp16, 128 words each).
     std::optional<u32> tensor_scratch_word;
+    /// Set when the software HMMA helpers gather from shared memory: each 32-lane subgroup owns
+    /// 192 words from this word (128 of A, then 64 of B).
+    std::optional<u32> software_matrix_scratch_word;
     Id tensor_subgroup_id{};
     std::vector<Id> interfaces;
     std::vector<std::pair<u32, spv::Op>> opcode_rewrites;
+    /// Storage float32 atomic adds use OpAtomicFAddEXT (Profile::support_float32_atomic_add).
+    bool native_f32_atomic_add{};
 
     // Task and mesh programs. Their stage buffer: the task's output region is the task payload
     // (the mesh stage's input region); the mesh output regions live in workgroup memory until
@@ -420,6 +440,21 @@ public:
     std::vector<MeshLineTarget> mesh_primitive_targets;
     std::array<Id, 2> mesh_outputs_marker{};
     std::array<Id, 4> mesh_tasks_marker{};
+    /// Culling added to a native mesh program (the MESH_CULL_* bits it can take), its
+    /// CullPrimitiveEXT output, one "a triangle is left" word per invocation and the viewport
+    /// push constant.
+    u32 mesh_cull{};
+    Id mesh_cull_primitive{};
+    Id mesh_cull_any{};
+    Id mesh_used_vertices{}; ///< MESH_OUT_COUNT: one word per invocation
+    Id mesh_cull_viewport{};
+    /// MESH_OUT_* bits in effect, the PrimitiveShadingRateKHR output, the last tested triangle's
+    /// "in front of the camera" and bounding box size in pixels (CulledTriangle), and the rate
+    /// of each primitive group of the invocation.
+    u32 mesh_out{};
+    Id mesh_shading_rate{};
+    std::array<Id, 3> mesh_triangle_extent{};
+    std::vector<Id> mesh_primitive_rates;
     /// Mesh emulation (RuntimeInfo::mesh_as_compute): the output storage buffer and the
     /// pointer type to one of its words.
     Id mesh_output_buffer{};
@@ -477,7 +512,12 @@ private:
     void DefineImages(const Info& info, u32& binding, u32& scaling_index);
     void DefineAttributeMemAccess(const Info& info);
     void DefineWriteStorageCasLoopFunction(const Info& info);
+    /// Defines the helpers global memory accesses call: each finds the storage buffer holding
+    /// the address and loads, writes or atomically updates it there.
     void DefineGlobalMemoryFunctions(const IR::Program& program);
+    using GlobalBaseWords = std::map<std::pair<u32, u32>, Id>;
+    /// The base address (u64) of a storage buffer descriptor, read from its pointer.
+    Id GlobalBufferBase(const Info& info, size_t index, GlobalBaseWords* cbuf_words);
     void DefineRescalingInput(const Info& info);
     void DefineRescalingInputPushConstant();
     void DefineRescalingInputUniformConstant();

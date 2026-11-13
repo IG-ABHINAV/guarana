@@ -102,9 +102,11 @@ class AdapterTest(unittest.TestCase):
         names = [tool["name"] for tool in self.adapter.handle({"id": 2, "method": "tools/list"})
                  ["result"]["tools"]]
         self.assertEqual(names, ["status", "frame_times", "screenshot", "log_tail", "log_filter", "capture_frame",
-                                 "capture_image", "reject_shaders", "sample", "read_memory",
+                                 "capture_image", "reject_shaders", "set_shading_rate", "set_prepass",
+                                 "sample", "read_memory",
                                  "search_memory", "read_gpu_memory", "input",
-                                 "input_sequence", "host_timing"])
+                                 "input_sequence", "host_timing", "power", "power_set",
+                                 "gpu_costs", "frame_budget", "memory"])
         self.assertEqual(self.adapter.handle({"id": 3, "method": "bogus"})["error"]["code"], -32601)
 
     def test_frame_times_is_forwarded(self):

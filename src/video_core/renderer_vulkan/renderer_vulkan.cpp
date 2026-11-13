@@ -19,6 +19,7 @@
 #include "common/scope_exit.h"
 #include "common/settings.h"
 #include "core/core_timing.h"
+#include "core/game_presets.h"
 #include "core/frontend/graphics_context.h"
 #include "video_core/capture.h"
 #include "video_core/gpu.h"
@@ -142,9 +143,42 @@ VkSurfaceFormatKHR ChooseOutputFormat(const vk::PhysicalDevice& physical, VkSurf
 #endif
 }
 
+// Game presets match on the GPU's capabilities and set values the device and the renderer read
+// while they are built.
+void ApplyGamePresets(const Device& device) {
+    using Core::GameSettings::GPUVendor;
+    GPUVendor vendor = GPUVendor::Unknown;
+    switch (device.GetDriverID()) {
+    case VK_DRIVER_ID_INTEL_PROPRIETARY_WINDOWS:
+    case VK_DRIVER_ID_INTEL_OPEN_SOURCE_MESA:
+        vendor = GPUVendor::Intel;
+        break;
+    case VK_DRIVER_ID_NVIDIA_PROPRIETARY:
+        vendor = GPUVendor::Nvidia;
+        break;
+    case VK_DRIVER_ID_AMD_PROPRIETARY:
+    case VK_DRIVER_ID_AMD_OPEN_SOURCE:
+    case VK_DRIVER_ID_MESA_RADV:
+        vendor = GPUVendor::AMD;
+        break;
+    default:
+        break;
+    }
+    Core::GamePresets::Apply(Settings::GetCurrentProgramID(),
+                             Core::GamePresets::GpuInfo{
+                                 .vendor = vendor,
+                                 .integrated = device.IsIntegrated(),
+                                 .software_tensor_math =
+                                     !device.IsCooperativeHmmaSupported() &&
+                                     !device.IsCooperativeHmma16x16x16Supported(),
+                             });
+}
+
 } // Anonymous namespace
 
-Device CreateDevice(const vk::Instance& instance, const vk::InstanceDispatch& dld, VkSurfaceKHR surface) {
+Device CreateDevice(const vk::Instance& instance, const vk::InstanceDispatch& dld,
+                    VkSurfaceKHR surface,
+                    const std::function<void(const Device&)>& on_capabilities) {
     const std::vector<VkPhysicalDevice> devices = instance.EnumeratePhysicalDevices();
     const u32 device_index = Settings::values.vulkan_device.GetValue();
     if (device_index >= u32(devices.size())) {
@@ -152,7 +186,7 @@ Device CreateDevice(const vk::Instance& instance, const vk::InstanceDispatch& dl
         throw vk::Exception(VK_ERROR_INITIALIZATION_FAILED);
     }
     const vk::PhysicalDevice physical_device(devices[device_index], dld);
-    return Device(*instance, physical_device, surface, dld);
+    return Device(*instance, physical_device, surface, dld, on_capabilities);
 }
 
 RendererVulkan::RendererVulkan(Core::Frontend::EmuWindow& emu_window,
@@ -179,7 +213,7 @@ try
                                                     : vk::DebugUtilsMessenger{})
     // Create surface
     , surface(CreateSurface(instance, render_window.GetWindowInfo()))
-    , device(CreateDevice(instance, dld, *surface))
+    , device(CreateDevice(instance, dld, *surface, ApplyGamePresets))
     , memory_allocator(device)
     , state_tracker()
     , scheduler(device, state_tracker)
@@ -236,6 +270,7 @@ try
                       ? fmt::format("{} {}", device.GetVendorName(), GetDriverVersion(device))
                       : std::string{},
         .api = "Vulkan",
+        .integrated = device.IsIntegrated(),
     };
     Report();
 } catch (const vk::Exception& exception) {
@@ -286,30 +321,68 @@ void RendererVulkan::Composite(std::span<const Tegra::FramebufferConfig> framebu
     frame->color_space = output.color_space;
 
     scheduler.RequestOutsideRenderPassOperationContext();
+    {
+        const auto& layout = render_window.GetFramebufferLayout();
+        scheduler.RecordEmuBegin(TraceCategory::Present, {layout.width, layout.height, 0});
+    }
     blit_swapchain.DrawToFrame(device, rasterizer, frame, framebuffers,
                               render_window.GetFramebufferLayout(),
                               present_manager.SwapchainImageCount(), output_format.format, output);
+    scheduler.RecordEmuEnd();
 
 #ifdef HAS_LSFG
-    void(frame_gen.WantedGenerations(present_manager.MaxExtraFrames(),
-                                     present_manager.TakeBlockedTime()));
+    // Frames predicted from this one (EDEN_NX2_EXTRAPOLATE): presented after it, unlike
+    // interpolated frames. The extrapolation pass writes SDR, so HDR output pauses it.
+    std::vector<Frame*> predicted_frames;
+    if (output.IsHdr() && ExtrapolationRequested()) {
+        frame_gen.Pause();
+    } else {
+        if (!output.IsHdr()) {
+            const auto& layout = render_window.GetFramebufferLayout();
+            frame_gen.SetExtrapolationSource(
+                rasterizer.OcarinaExtrapolationSource(),
+                VkRect2D{.offset = {static_cast<s32>(layout.screen.left),
+                                    static_cast<s32>(layout.screen.top)},
+                         .extent = {layout.screen.GetWidth(), layout.screen.GetHeight()}});
+        }
+        void(frame_gen.WantedGenerations(present_manager.MaxExtraFrames(),
+                                         present_manager.TakeBlockedTime()));
 
-    frame_gen.Process(device, frame, frame->image_format, GuestExtent(framebuffers));
+        frame_gen.Process(device, frame, frame->image_format, GuestExtent(framebuffers));
 
-    const size_t generated_frames = frame_gen.GeneratedFrameCount();
-    // Each generated frame keeps the screen for an equal share of the real frame interval. Sent
-    // back to back, a high refresh rate display shows it for one refresh only.
-    const auto spacing = std::chrono::duration_cast<std::chrono::nanoseconds>(
-        std::chrono::duration<f32>(std::min(frame_gen.FrameInterval(), 0.1f) /
-                                   static_cast<f32>(generated_frames + 1)));
-    for (size_t generation = 0; generation < generated_frames; ++generation) {
-        Frame* generated = present_manager.GetRenderFrame();
-        generated->color_space = output.color_space;
-        generated->present_spacing = spacing;
-        blit_swapchain.PrepareFrame(device, generated, render_window.GetFramebufferLayout());
-        frame_gen.GenerateInto(device, generated, generation);
-        scheduler.Flush(*generated->render_ready);
-        present_manager.Present(generated);
+        const size_t generated_frames = frame_gen.GeneratedFrameCount();
+        const bool predict = frame_gen.Extrapolating();
+        // Each generated frame keeps the screen for an equal share of the real frame interval
+        // (EDEN_NX2_CADENCE: of the target rate). Sent back to back, a high refresh rate display
+        // shows it for one refresh only.
+        auto spacing = frame_gen.CadenceSpacing();
+        if (spacing.count() == 0) {
+            spacing = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::duration<f32>(std::min(frame_gen.FrameInterval(), 0.1f) /
+                                           static_cast<f32>(generated_frames + 1)));
+        }
+        for (size_t generation = 0; generation < generated_frames; ++generation) {
+            Frame* generated = present_manager.GetRenderFrame();
+            generated->color_space = output.color_space;
+            generated->present_spacing = spacing;
+            blit_swapchain.PrepareFrame(device, generated, render_window.GetFramebufferLayout());
+            frame_gen.GenerateInto(device, generated, generation);
+            if (predict) {
+                // Recorded with the real frame's commands, which it reads; shown after it.
+                predicted_frames.push_back(generated);
+                continue;
+            }
+            scheduler.Flush(*generated->render_ready);
+            present_manager.Present(generated);
+        }
+        if (!predicted_frames.empty()) {
+            // The real frame and each predicted frame but the last hold the screen one spacing.
+            // The last leaves the next real frame free to show as soon as it is ready, as the real
+            // frame does after interpolated ones: (gens + 1) spacings plus copy time per batch
+            // would let the present queue creep behind.
+            frame->present_spacing = spacing;
+            predicted_frames.back()->present_spacing = {};
+        }
     }
 #endif
 
@@ -339,6 +412,10 @@ void RendererVulkan::Composite(std::span<const Tegra::FramebufferConfig> framebu
     const auto presented = trace ? std::chrono::steady_clock::now()
                                  : std::chrono::steady_clock::time_point{};
 #ifdef HAS_LSFG
+    for (Frame* predicted : predicted_frames) {
+        scheduler.Flush(*predicted->render_ready);
+        present_manager.Present(predicted);
+    }
     scheduler.DispatchWork();
 #endif
 

@@ -180,6 +180,7 @@ struct InstanceDispatch {
     PFN_vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR
         vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR{};
     PFN_vkGetPhysicalDeviceFeatures2 vkGetPhysicalDeviceFeatures2{};
+    PFN_vkGetPhysicalDeviceFragmentShadingRatesKHR vkGetPhysicalDeviceFragmentShadingRatesKHR{};
     PFN_vkGetPhysicalDeviceFormatProperties vkGetPhysicalDeviceFormatProperties{};
     PFN_vkGetPhysicalDeviceFormatProperties2 vkGetPhysicalDeviceFormatProperties2{};
     PFN_vkGetPhysicalDeviceMemoryProperties vkGetPhysicalDeviceMemoryProperties{};
@@ -219,6 +220,7 @@ struct DeviceDispatch : InstanceDispatch {
     PFN_vkCmdBlitImage vkCmdBlitImage{};
     PFN_vkCmdClearAttachments vkCmdClearAttachments{};
     PFN_vkCmdClearColorImage vkCmdClearColorImage{};
+    PFN_vkCmdClearDepthStencilImage vkCmdClearDepthStencilImage{};
     PFN_vkCmdCopyBuffer vkCmdCopyBuffer{};
     PFN_vkCmdCopyBufferToImage vkCmdCopyBufferToImage{};
     PFN_vkCmdCopyImage vkCmdCopyImage{};
@@ -250,6 +252,7 @@ struct DeviceDispatch : InstanceDispatch {
     PFN_vkCmdSetBlendConstants vkCmdSetBlendConstants{};
     PFN_vkCmdSetCullModeEXT vkCmdSetCullModeEXT{};
     PFN_vkCmdSetDepthBias vkCmdSetDepthBias{};
+    PFN_vkCmdSetFragmentShadingRateKHR vkCmdSetFragmentShadingRateKHR{};
     PFN_vkCmdSetDepthBias2EXT vkCmdSetDepthBias2EXT{};
     PFN_vkCmdSetDepthBounds vkCmdSetDepthBounds{};
     PFN_vkCmdSetDepthBoundsTestEnableEXT vkCmdSetDepthBoundsTestEnableEXT{};
@@ -352,6 +355,8 @@ struct DeviceDispatch : InstanceDispatch {
     PFN_vkGetPipelineBinaryDataKHR vkGetPipelineBinaryDataKHR{};
     PFN_vkReleaseCapturedPipelineDataKHR vkReleaseCapturedPipelineDataKHR{};
     PFN_vkGetPipelineExecutableStatisticsKHR vkGetPipelineExecutableStatisticsKHR{};
+    PFN_vkGetPipelineExecutableInternalRepresentationsKHR
+        vkGetPipelineExecutableInternalRepresentationsKHR{};
     PFN_vkGetQueryPoolResults vkGetQueryPoolResults{};
     PFN_vkGetSemaphoreCounterValue vkGetSemaphoreCounterValue{};
     PFN_vkMapMemory vkMapMemory{};
@@ -1140,6 +1145,12 @@ public:
     std::vector<VkPipelineExecutableStatisticKHR> GetPipelineExecutableStatisticsKHR(
         VkPipeline pipeline, u32 executable_index) const;
 
+    /// The internal representations of an executable of a pipeline created with
+    /// VK_PIPELINE_CREATE_CAPTURE_INTERNAL_REPRESENTATIONS_BIT_KHR. Each pData points into storage.
+    std::vector<VkPipelineExecutableInternalRepresentationKHR>
+    GetPipelineExecutableInternalRepresentationsKHR(VkPipeline pipeline, u32 executable_index,
+                                                    std::vector<std::vector<char>>& storage) const;
+
     void UpdateDescriptorSets(Span<VkWriteDescriptorSet> writes,
                               Span<VkCopyDescriptorSet> copies) const noexcept;
 
@@ -1234,6 +1245,9 @@ public:
 
     /// Matrix shapes and types of VK_KHR_cooperative_matrix; empty when the driver lacks it.
     std::vector<VkCooperativeMatrixPropertiesKHR> GetCooperativeMatrixPropertiesKHR() const;
+
+    /// Fragment sizes of VK_KHR_fragment_shading_rate; empty when the driver lacks it.
+    std::vector<VkPhysicalDeviceFragmentShadingRateKHR> GetFragmentShadingRatesKHR() const;
 
     bool GetSurfaceSupportKHR(u32 queue_family_index, VkSurfaceKHR) const;
 
@@ -1383,6 +1397,12 @@ public:
     void ClearColorImage(VkImage image, VkImageLayout layout, VkClearColorValue color,
                          Span<VkImageSubresourceRange> ranges) {
         dld->vkCmdClearColorImage(handle, image, layout, &color, ranges.size(), ranges.data());
+    }
+
+    void ClearDepthStencilImage(VkImage image, VkImageLayout layout, VkClearDepthStencilValue value,
+                                Span<VkImageSubresourceRange> ranges) {
+        dld->vkCmdClearDepthStencilImage(handle, image, layout, &value, ranges.size(),
+                                         ranges.data());
     }
 
     void BlitImage(VkImage src_image, VkImageLayout src_layout, VkImage dst_image,
@@ -1589,6 +1609,12 @@ public:
 
     void SetDepthBias(float constant_factor, float clamp, float slope_factor) const noexcept {
         dld->vkCmdSetDepthBias(handle, constant_factor, clamp, slope_factor);
+    }
+
+    void SetFragmentShadingRateKHR(
+        const VkExtent2D& fragment_size,
+        const std::array<VkFragmentShadingRateCombinerOpKHR, 2>& combiner_ops) const noexcept {
+        dld->vkCmdSetFragmentShadingRateKHR(handle, &fragment_size, combiner_ops.data());
     }
 
     void SetDepthBias(float constant_factor, float clamp, float slope_factor,

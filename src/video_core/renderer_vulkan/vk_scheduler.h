@@ -8,6 +8,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <compare>
 #include <condition_variable>
 #include <cstddef>
 #include <functional>
@@ -27,6 +28,7 @@
 #include "common/logging.h"
 #include "common/polyfill_thread.h"
 #include "common/settings.h"
+#include "video_core/gpu_costs.h"
 #include "video_core/gpu_split.h"
 #include "video_core/renderer_vulkan/fragment_barrier_state.h"
 #include "video_core/renderer_vulkan/vk_master_semaphore.h"
@@ -47,6 +49,32 @@ class StateTracker;
 class UploadBatch;
 
 struct QueryCacheParams;
+
+/// Emulator-issued GPU work timed by the cost tracer (DKB gpu_work "emu:<name>" rows).
+enum class TraceCategory : u8 {
+    ImageCopy,
+    ImageCopyMsaa,
+    ImageReinterpret,
+    ImageBlit,
+    ImageConvert,
+    ImageUpload,
+    ImageDownload,
+    BufferCopy,
+    BufferUploadBatch,
+    UploadCmdbuf, ///< The whole reordered-upload command buffer of a submission
+    ComputeVertexRepack,
+    ComputeUint8Index,
+    ComputeQuadIndex,
+    ComputeCondResolve,
+    ComputeQueryPrefixScan,
+    ComputeAstc,
+    ComputeBcEncode,
+    ComputeUnswizzle3D,
+    QueryCopy,
+    ClearInPass,
+    Present,
+    Count,
+};
 
 /// The scheduler abstracts command buffer and fence management with an interface that's able to do
 /// OpenGL-like operations on Vulkan command buffers.
@@ -90,7 +118,8 @@ public:
 
     enum class FrameMark : u8 { None, Start, End, Both };
     /// GPU thread, once per present: the frame-end mark this present gets. EDEN_DKB_FRAME_TRACE
-    /// marks every present; otherwise only the two presents after RequestGpuBusySample.
+    /// and cost sampling mark every present; otherwise only the two presents after
+    /// RequestGpuBusySample.
     [[nodiscard]] FrameMark NextFrameMark();
     void MarkFrameEnd(u64 frame, FrameMark mark);
     /// Any thread: asks for one host GPU timestamp sample of the frame after the next present.
@@ -99,23 +128,74 @@ public:
     }
     /// Host GPU busy time of the last sampled frame, nullopt when none was taken in 3 s.
     [[nodiscard]] std::optional<double> GpuBusyMs() const;
+    /// Any thread: turns the per-draw and per-pass timing of one frame a second on or off
+    /// without the DKB log lines. False when the query pools were not created at startup
+    /// (EDEN_NX2_COST_SAMPLING=1, EDEN_NX2_DEBUG_SERVER or EDEN_DKB_FRAME_TRACE=1).
+    bool RequestCostSampling(bool on) {
+        if (!trace_work_pool) {
+            return false;
+        }
+        if (cost_sampling.exchange(on, std::memory_order_relaxed) && !on) {
+            // One more frame-end mark closes the sample in flight.
+            gpu_busy_marks.store(1, std::memory_order_relaxed);
+        }
+        return true;
+    }
+    [[nodiscard]] bool CostSampling() const {
+        return cost_sampling.load(std::memory_order_relaxed);
+    }
+    /// Costs of the last sampled frame; frame is 0 when none was taken.
+    [[nodiscard]] VideoCore::GpuCostSnapshot GpuCosts() const;
     void TraceGraphicsPipeline(const std::array<u64, 6>& hashes);
     void TraceComputePipeline(u64 hash);
     /// Worker thread, inside a recorded command: timestamps one draw or dispatch of a sampled
     /// submission. A draw passes its vertex and fragment hashes, a dispatch its compute hash.
+    /// kind tags other draws: m mesh, e emulated mesh, i indirect count, b indirect byte count.
     template <typename Func>
     void TraceGpuWork(vk::CommandBuffer cmdbuf, u64 hash, u64 fragment_hash,
-                      std::array<u32, 3> size, Func&& work) {
-        if (!trace_gpu_recording || !trace_work_pool || trace_work_count == TraceMaxWork) {
+                      std::array<u32, 3> size, Func&& work, char kind = '\0') {
+        if (!trace_gpu_recording || !trace_costs_active) {
+            work();
+            return;
+        }
+        if (trace_work_count == TraceMaxWork) {
+            ++trace_work_dropped;
             work();
             return;
         }
         const u32 query = trace_work_count * 2;
-        trace_work_items[trace_work_count++] = {hash, fragment_hash, size};
+        trace_work_items[trace_work_count++] = {hash, fragment_hash, size, kind, trace_pass_open};
         cmdbuf.WriteTimestamp(VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, *trace_work_pool, query);
         work();
         cmdbuf.WriteTimestamp(VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, *trace_work_pool, query + 1);
     }
+
+    /// Worker thread, inside a recorded command: times emulator-issued work (kind 'x').
+    template <typename Func>
+    void TraceEmuWork(vk::CommandBuffer cmdbuf, TraceCategory category, std::array<u32, 3> size,
+                      Func&& work) {
+        TraceGpuWork(cmdbuf, static_cast<u64>(category), 0, size, std::forward<Func>(work),
+                     TraceEmuKind);
+    }
+
+    /// Record() whose command is timed as emulator work in sampled frames. Without the cost
+    /// pools (no tracing, sampling or debug server) it is Record().
+    template <typename T>
+        requires std::is_invocable_v<T, vk::CommandBuffer>
+    void RecordEmu(TraceCategory category, std::array<u32, 3> size, T&& c) {
+        if (!trace_work_pool) {
+            Record(std::move(c));
+            return;
+        }
+        Record([this, category, size, command = std::move(c)](vk::CommandBuffer cmdbuf) {
+            TraceEmuWork(cmdbuf, category, size, [&] { command(cmdbuf); });
+        });
+    }
+
+    /// Times everything recorded between the two calls as one emulator work item. Spans do not
+    /// nest and do not cross a submission; items timed inside one are counted in both.
+    void RecordEmuBegin(TraceCategory category, std::array<u32, 3> size);
+    void RecordEmuEnd();
 
     /// Sends currently recorded work to the worker thread.
     void DispatchWork();
@@ -123,6 +203,32 @@ public:
     /// Requests to begin a renderpass.
     void RequestRenderpass(const Framebuffer* framebuffer,
                            std::source_location location = std::source_location::current());
+
+    /// As RequestRenderpass, for a pass that samples nothing or a draw whose sampled images went
+    /// through ReleaseDepthForSampling: another pass's depth image may stay in its attachment
+    /// layout.
+    void RequestDrawRenderpass(const Framebuffer* framebuffer,
+                               std::source_location location = std::source_location::current());
+
+    /// EDEN_NX2_DEPTH_OPTIMAL. 0: depth attachments stay in GENERAL. 1: single-sample depth
+    /// attachments are in DEPTH_STENCIL_ATTACHMENT_OPTIMAL during their passes. 2: and stay
+    /// there after the pass until something else needs the image (ReleaseRestingDepth).
+    [[nodiscard]] static u32 DepthOptimalMode();
+
+    /// Whether `image` (not null) is the active pass's depth attachment in its attachment layout
+    /// or the one the last pass left there.
+    [[nodiscard]] bool IsDepthInAttachmentLayout(VkImage image) const noexcept {
+        return image == resting_depth_image || image == pass_depth_image;
+    }
+
+    /// Returns the depth image the last pass left in DEPTH_STENCIL_ATTACHMENT_OPTIMAL to GENERAL,
+    /// ending the render pass: all the code outside render passes expects GENERAL. With `image`,
+    /// only when it is that image.
+    void ReleaseRestingDepth(VkImage image = VK_NULL_HANDLE);
+
+    /// Before a draw samples `image`: ends the pass that has it as its depth attachment and
+    /// returns it to GENERAL.
+    void ReleaseDepthForSampling(VkImage image);
 
     /// Defers a full-attachment color clear so it becomes the next render pass.
     bool DeferColorClear(const Framebuffer* framebuffer, u32 rt_slot, const VkClearValue& value);
@@ -137,6 +243,14 @@ public:
     /// of a renderpass.
     void RequestOutsideRenderPassOperationContext(
         std::source_location location = std::source_location::current());
+
+    /// The same for work that reads and writes no image.
+    void RequestOutsideRenderPassBufferContext(
+        std::source_location location = std::source_location::current());
+
+    /// The same for work whose only image is `image`.
+    void RequestOutsideRenderPassImageContext(
+        VkImage image, std::source_location location = std::source_location::current());
 
     void DeferFragmentBarrier() {
         fragment_barrier.Defer(state.renderpass != VK_NULL_HANDLE);
@@ -177,6 +291,12 @@ public:
     /// Update the pipeline to the current execution context.
     bool UpdateGraphicsPipeline(GraphicsPipeline* pipeline);
 
+    /// A recorded draw bound other pipelines than the one UpdateGraphicsPipeline was told of
+    /// (alpha-test prepass split): the next draw binds its pipeline again.
+    void ForgetGraphicsPipeline() {
+        state.graphics_pipeline = nullptr;
+    }
+
     /// Worker thread only: whether the bound graphics pipeline failed to build, so the draws
     /// recorded after it must be dropped instead of reaching the driver without a pipeline.
     void SetGraphicsPipelineMissing(bool missing) {
@@ -184,6 +304,16 @@ public:
     }
     [[nodiscard]] bool GraphicsPipelineMissing() const {
         return graphics_pipeline_missing;
+    }
+
+    /// Returns true when the fragment shading rate has to be set in the command buffer.
+    bool UpdateFragmentShadingRate(VkExtent2D rate) {
+        if (state.fragment_shading_rate.width == rate.width &&
+            state.fragment_shading_rate.height == rate.height) {
+            return false;
+        }
+        state.fragment_shading_rate = rate;
+        return true;
     }
 
     /// Update the rescaling state. Returns true if the state has to be updated.
@@ -208,6 +338,11 @@ public:
     /// Consecutive in-order staging uploads share barriers until their destinations overlap,
     /// a source depends on a pending copy, or the batch is full. Call outside a render pass.
     void RecordUpload(VkBuffer src, VkBuffer dst, std::span<const VkBufferCopy> copies);
+
+    /// EDEN_NX2_UMA bit 1. Uploads that go in the upload command buffer, ahead of everything
+    /// recorded in this submission: they wait for the submission, or for an upload that writes
+    /// the same bytes, and are recorded as one vkCmdCopyBuffer per destination.
+    void RecordReorderedUpload(VkBuffer src, VkBuffer dst, std::span<const VkBufferCopy> copies);
 
     /// Send work to a separate thread.
     template <typename T>
@@ -240,7 +375,7 @@ public:
     /// Whether anything was recorded since the last Flush or Finish, or waits to be: batched
     /// uploads and a deferred clear reach the command buffer only at the next record or submit.
     [[nodiscard]] bool RecordedSinceSubmit() const noexcept {
-        return record_serial != submitted_serial || uploads_pending ||
+        return record_serial != submitted_serial || uploads_pending || reorders_pending ||
                deferred_clear.framebuffer != nullptr;
     }
     /// Counts a flush skipped because nothing was recorded (GPU profile).
@@ -450,6 +585,7 @@ private:
         VkFramebuffer framebuffer{};
         VkExtent2D render_area = {0, 0};
         GraphicsPipeline* graphics_pipeline = nullptr;
+        VkExtent2D fragment_shading_rate = {0, 0}; ///< {0, 0}: not set in this command buffer
         bool is_rescaling = false;
         bool rescaling_defined = false;
         bool mesh_layout = false;
@@ -478,16 +614,67 @@ private:
     void AllocateWorkerCommandBuffer();
 
     void TraceGpuSubmission();
-    void ReportWorkTimes();
+    /// Reads the work timestamps into trace_work_ms and trace_pass_*_ms; the item count.
+    u32 FetchWorkTimes();
+    void ReportWorkTimes(u32 count, double submission_sum_ms, VideoCore::GpuCostSnapshot& costs);
+    void ReportPassTimes(VideoCore::GpuCostSnapshot& costs);
+    /// Recording thread: whether draws and passes are to be timed in sampled frames.
+    [[nodiscard]] bool TraceCostsWanted() const {
+        return Common::DkbFrameTrace::Enabled() || cost_sampling.load(std::memory_order_relaxed);
+    }
     void TraceShader(u64 hash, u32 stage);
 
-    u64 SubmitExecution(VkSemaphore signal_semaphore, VkSemaphore wait_semaphore);
+    /// Where a flush or a render pass end was asked from (static strings; null when unknown).
+    struct TraceSite {
+        const char* file{};
+        const char* function{};
+        u32 line{};
+    };
+    static TraceSite MakeTraceSite(const std::source_location& location) {
+        return {location.file_name(), location.function_name(), location.line()};
+    }
+    enum class PassEnd : u8 {
+        Copy,
+        Wfi,
+        Query,
+        Submit,
+        Switch,
+        Upload,
+        Download,
+        Buffer,
+        Compute,
+        Dispatch,
+        Clear,
+        Other,
+        Count,
+    };
+    static PassEnd ClassifyPassEnd(const TraceSite& site, bool render_pass_request);
+
+    u64 SubmitExecution(VkSemaphore signal_semaphore, VkSemaphore wait_semaphore,
+                        TraceSite site);
 
     void AllocateNewContext();
 
     void EndPendingOperations();
 
     void EndRenderPass();
+
+    /// Ends the render pass for work asked from `location`.
+    void EndRenderPassForOutsideWork(const std::source_location& location);
+
+    /// Picks RenderPassKey::depth_layout for the pass about to begin on `framebuffer` (none is
+    /// active) and returns the resting depth image to GENERAL when that pass can't take it over.
+    [[nodiscard]] u8 PickDepthLayout(const Framebuffer* framebuffer);
+
+    /// The active pass's depth attachment when it is not in GENERAL, and its layout afterwards.
+    VkImage pass_depth_image{};
+    VkImageSubresourceRange pass_depth_range{};
+    VkImageLayout pass_depth_final_layout = VK_IMAGE_LAYOUT_GENERAL;
+    /// The depth image the last pass left in DEPTH_STENCIL_ATTACHMENT_OPTIMAL (mode 2). Never set
+    /// while a pass with a pass_depth_image is active.
+    VkImage resting_depth_image{};
+    VkImageSubresourceRange resting_depth_range{};
+    bool keep_resting_depth{};
 
     void AcquireNewChunk();
 
@@ -507,6 +694,11 @@ private:
     /// Records pending uploads before another command, worker handoff, or submission tick.
     void FlushUploads();
 
+    std::unique_ptr<UploadBatch> reorder_batch; ///< RecordReorderedUpload's pending copies
+    bool reorders_pending{};
+    /// Records the pending reordered uploads in the upload command buffer.
+    void FlushReorderedUploads();
+
     vk::QueryPool trace_query_pool;
     static constexpr u32 TraceMaxSubmissions = 512;
     struct SubmissionTrace {
@@ -520,19 +712,67 @@ private:
         u32 num_shaders{};
         u32 untracked_uses{};
         std::array<ShaderUse, 32> shaders{};
+        /// Work and pass items recorded in this submission: [begin, end).
+        u32 work_begin{};
+        u32 work_end{};
+        u32 pass_begin{};
+        u32 pass_end{};
+        const char* flush_file{};
+        const char* flush_function{};
+        u32 flush_line{};
     };
     SubmissionTrace trace_work;
     std::vector<SubmissionTrace> trace_submissions;
-    static constexpr u32 TraceMaxWork = 4096;
+    static constexpr u32 TraceMaxWork = 8192;
+    static constexpr u32 TraceMaxPasses = 2048;
+    static constexpr u32 TraceNoPass = ~u32{0};
+    static constexpr char TraceEmuKind = 'x'; ///< WorkTrace::kind of emulator work
     struct WorkTrace {
-        u64 hash{};
+        u64 hash{}; ///< A TraceCategory for emulator work
         u64 fragment_hash{};
         /// Dispatch grid, or vertex and instance counts of a draw; zero when indirect.
         std::array<u32, 3> size{};
+        char kind{};
+        u32 pass{TraceNoPass}; ///< The traced render pass it ran in
+        u32 span_end{};        ///< RecordEmuBegin items: the item count at RecordEmuEnd
     };
     vk::QueryPool trace_work_pool;
     std::vector<WorkTrace> trace_work_items;
+    std::vector<double> trace_work_ms; ///< Per item, negative when not measured
     u32 trace_work_count{};
+    u32 trace_work_dropped{};
+    u32 trace_span_item{TraceNoPass};   ///< Worker: the open RecordEmuBegin item
+    u32 trace_upload_item{TraceNoPass}; ///< Worker: this submission's UploadCmdbuf item
+    u32 trace_sub_work_begin{};         ///< Worker: work and pass counts when this
+    u32 trace_sub_pass_begin{};         ///< submission started
+    /// What DKB gpu_pass groups render passes by. Formats are PixelFormat values.
+    struct PassTrace {
+        auto operator<=>(const PassTrace&) const = default;
+
+        u32 width{};
+        u32 height{};
+        u8 color_format{}; ///< First color target's, Invalid without one
+        u8 num_colors{};
+        u8 depth_format{};
+        u8 samples{};
+    };
+    /// Worker thread: timestamps around a render pass of a sampled submission. Four per pass:
+    /// before and after vkCmdBeginRenderPass, before vkCmdEndRenderPass and after its barrier.
+    void TracePassBegin(vk::CommandBuffer cmdbuf, const PassTrace& pass);
+    void TracePassStamp(vk::CommandBuffer cmdbuf, u32 stamp);
+    void TracePassEnd(vk::CommandBuffer cmdbuf, PassEnd reason);
+    vk::QueryPool trace_pass_pool;
+    std::vector<PassTrace> trace_pass_items;
+    std::vector<PassEnd> trace_pass_reasons;
+    std::vector<double> trace_pass_draw_ms; ///< Guest work timed inside each pass
+    std::vector<double> trace_pass_emu_ms;  ///< Emulator work timed inside each pass
+    /// Recording thread: why the open traced pass is about to end (set by the caller of
+    /// EndRenderPass, Other otherwise).
+    PassEnd pass_end_reason{PassEnd::Other};
+    u32 trace_pass_count{};
+    u32 trace_pass_dropped{};
+    u32 trace_pass_open{TraceNoPass};
+    bool trace_pass_begun{}; ///< Recording thread: the open render pass recorded TracePassBegin
     Common::DkbFrameTrace::RateLimit trace_gpu_rate;
     u64 trace_gpu_tick{};
     u64 trace_frame_end{};
@@ -548,6 +788,12 @@ private:
     FrameMark trace_frame_mark{};
     /// The pending sample covers exactly one frame, so its busy time can be shown.
     bool trace_gpu_publish{};
+    /// Worker thread: the sample in flight times draws and passes (latched when it starts).
+    bool trace_costs_active{};
+
+    std::atomic<bool> cost_sampling{};
+    mutable std::mutex gpu_costs_mutex;
+    VideoCore::GpuCostSnapshot gpu_costs;
 
     std::atomic<u32> gpu_busy_marks{};
     struct GpuBusySample {

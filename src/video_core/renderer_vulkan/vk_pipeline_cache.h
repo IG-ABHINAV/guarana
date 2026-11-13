@@ -132,12 +132,15 @@ public:
                            TextureCache& texture_cache, VideoCore::ShaderNotify& shader_notify_);
     ~PipelineCache();
 
+    /// The pipeline for the current 3D state, built or queued when it isn't cached; null when
+    /// the shaders can't be used.
     [[nodiscard]] GraphicsPipeline* CurrentGraphicsPipeline();
 
     void TickFrame();
 
     [[nodiscard]] ComputePipeline* CurrentComputePipeline(u64& native_key);
 
+    /// Loads the title's disk caches and builds or queues their pipelines.
     void LoadDiskResources(u64 title_id, std::stop_token stop_loading,
                            const VideoCore::DiskResourceLoadCallback& callback);
 
@@ -267,6 +270,8 @@ private:
     DescriptorPool& descriptor_pool;
     GuestDescriptorQueue& guest_descriptor_queue;
     DescriptorBufferRing& descriptor_buffer_ring;
+    /// 8192 templates: a frame's distinct textured draws, Donkey Kong Bananza's included.
+    DrawTemplates draw_templates{2048};
     RenderPassCache& render_pass_cache;
     BufferCache& buffer_cache;
     TextureCache& texture_cache;
@@ -281,10 +286,15 @@ private:
     std::optional<ScheduledPrebuild<GraphicsPipelineCacheKey, GraphicsPipeline>> scheduled_prebuild;
 
     GraphicsPipelineCacheKey graphics_key{};
+    u64 vertex_attribute_types{}; ///< graphics_key's attribute types before the program's mask
     GraphicsPipeline* current_pipeline{};
 
     /// Destroys graphics pipelines unused for a while, once the GPU is done with them.
     void EvictUnusedPipelines();
+    /// EDEN_NX2_PREPASS_HASHES, after the list changed: drops the built pipelines of listed
+    /// fragment shaders that have no prepass split, so that their next draw makes them with one.
+    void DropPipelinesWithoutPrepass();
+    u64 prepass_generation{}; ///< VideoCore::Nx2Debug::PrepassGeneration at the last frame end
     u64 frame_count{};
     /// Wait budget of native draws for unbuilt pipelines left in this frame, in microseconds
     /// (native_async_draws = Bounded). Only touched on the GPU thread; reset in TickFrame.

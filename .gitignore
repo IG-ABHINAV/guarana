@@ -67,3 +67,27 @@ vulkansdk*.exe
 
 # Build-time generated external sources
 externals/generated
+
+# Never commit keys, firmware, games or anything taken from them (AGENTS.md, "Never commit").
+# A safety net, not a licence: check `git status` anyway.
+*.keys
+prod.keys
+title.keys
+*.nsp
+*.xci
+*.nca
+*.nup
+*.nsz
+*.xcz
+**/nand/
+**/sdmc/
+# The synthetic containers the unit tests generate and read (see that folder's README).
+!src/tests/core/nx_fixtures/*.nsp
+# Dumps, captures and raw profiles
+*.rdc
+*.dmp
+*.profraw
+eden_log.txt*
+# tools/bench: rows (*.jsonl) are committed, saved debug server replies are not
+tools/bench/results/*.json
+!tools/bench/results/.gitkeep

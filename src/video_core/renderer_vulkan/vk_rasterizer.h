@@ -6,6 +6,7 @@
 #pragma once
 
 #include <array>
+#include <chrono>
 #include <optional>
 #include <string_view>
 #include <unordered_map>
@@ -24,6 +25,7 @@
 #include "video_core/ocarina_upscale.h"
 #include "video_core/rasterizer_interface.h"
 #include "video_core/renderer_vulkan/blit_image.h"
+#include "video_core/renderer_vulkan/present/extrapolation_source.h"
 #include "video_core/renderer_vulkan/vk_buffer_cache.h"
 #include "video_core/renderer_vulkan/vk_descriptor_buffer.h"
 #include "video_core/renderer_vulkan/vk_descriptor_pool.h"
@@ -175,6 +177,7 @@ public:
                                    std::array<f32, 2> motion_scale, bool use_history,
                                    std::optional<std::array<u32, 2>> render_region) override;
     VideoCommon::OotNetwork::BypassState* OotNetworkBypass() override;
+    void OotNetworkBypassed(u32 output_tic) override;
     Tegra::Engines::AccelerateDMAInterface& AccessAccelerateDMA() override;
     void AccelerateInlineToMemory(GPUVAddr address, size_t copy_size,
                                   std::span<const u8> memory) override;
@@ -189,6 +192,10 @@ public:
     std::optional<FramebufferTextureInfo> AccelerateDisplay(const Tegra::FramebufferConfig& config,
                                                             VAddr framebuffer_addr,
                                                             u32 pixel_stride);
+    /// Motion and depth of the frame being presented (Ocarina of Time's temporal upscale ran this
+    /// frame, or its anti-aliasing network was bypassed, and EDEN_NX2_EXTRAPOLATE is set). Call
+    /// after AccelerateDisplay.
+    std::optional<ExtrapolationSource> OcarinaExtrapolationSource() const;
 
 private:
     static constexpr const u64 NEEDS_D24[] = {
@@ -202,6 +209,11 @@ private:
 
     static constexpr VkDeviceSize DEFAULT_BUFFER_SIZE = 4 * sizeof(float);
 
+    /// IsGpuTickDone's rate limits (the GPU thread that polls suspended channels only).
+    u64 poll_submit_requested_tick{};
+    std::chrono::steady_clock::time_point poll_submit_requested_at{};
+    std::chrono::steady_clock::time_point poll_refreshed_at{};
+
     template <typename Func>
     void PrepareDraw(bool is_indexed, Func&&, bool is_indirect = false);
 
@@ -213,6 +225,10 @@ private:
     bool TryNx2IndirectReset(bool is_indexed, u32 instance_count);
 
     void FlushWork();
+
+    /// EDEN_NX2_UMA bit 8. Whether the draw budget's submission can wait: the host GPU still has
+    /// submitted work to run, and this submission holds fewer than 512 draws.
+    [[nodiscard]] bool DeferBudgetFlush(u32 budget);
 
     void TraceRenderState(bool is_indexed, const char* outcome, const Framebuffer* framebuffer);
 
@@ -273,6 +289,14 @@ private:
     /// EDEN_NX2_PENDING_WRITE_TRACE: logs bound buffer ranges with collected, unapplied CPU writes.
     void TracePendingCpuWrites(bool compute, std::span<const u64> shader_hashes);
     bool OcarinaTemporalEnabled() const;
+    /// EDEN_NX2_OOT_FSR_ANY with FSR as the temporal upscaler: the game's upscale is replaced at
+    /// every dynamic resolution step, at whatever scale it has.
+    bool OcarinaFsrAnyStep() const;
+    /// Frame extrapolation wants motion while the anti-aliasing network bypass, not a temporal
+    /// upscaler, handles the game's upscale: only the guide is made (OotNetworkBypassed).
+    bool OcarinaGuideOnly() const;
+    /// The scene camera, depth and Link's pose are captured.
+    bool OcarinaMotionTracked() const;
     void TrackOcarinaCamera();
     /// Offsets the viewport of Ocarina's scene draws (depth-tested, into the scene depth) by a
     /// sub-pixel amount that changes every frame while FSR replaces the game's upscale, so FSR
@@ -326,7 +350,10 @@ private:
         u64 depth_frame{};
         GPUVAddr depth_address{};
         u32 depth_tic{};
-        VkExtent2D extent{};
+        VkExtent2D extent{}; ///< of the scene's images
+        /// What the game drew of them, from the top left. The same without
+        /// EDEN_NX2_OOT_FSR_ANY; with it a low resolution step may be narrower (854 of 864).
+        VkExtent2D drawn{};
         std::array<f32, 16> current{};
         std::array<f32, 16> previous{};
     } oot_motion;
@@ -339,8 +366,29 @@ private:
     std::array<f32, 2> oot_jitter_offset{};  ///< what oot_jitter_frame's scene draws used
     std::optional<u64> oot_jitter_frame;
     u32 oot_jitter_phases{8}; ///< Halton sequence length for the last FSR frame's scale
+    // EDEN_NX2_OOT_FSR_ANY
+    VkExtent2D oot_fsr_scene{};  ///< size of the scene images of the last frame FSR replaced
+    VkExtent2D oot_fsr_render{}; ///< what the last frame FSR replaced drew of them
+    VkExtent2D oot_fsr_output{}; ///< and what FSR made of it
+    u32 oot_fsr_size_logs{};
+    std::optional<u64> oot_fsr_pass_frame; ///< a dispatch of this frame was the game's upscale
+    std::optional<u64> oot_fsr_hud_frame;  ///< oot_fsr_hud_scene is this frame's
+    VkImageView oot_fsr_hud_scene{};      ///< FSR's frame before the HUD (linear colour)
+    VkExtent2D oot_fsr_hud_extent{};
     std::optional<u64> oot_4k_scene_frame;
     VkImage oot_4k_guest_present{};
+    std::optional<u64> oot_hud_frame; ///< oot_hud_composite is this frame's image with the HUD
+    VkImageView oot_hud_composite{};
+    std::unique_ptr<class OcarinaMotionGuide> oot_guide;
+    bool oot_guide_failed{};
+    const char* oot_guide_reason{}; ///< why the last frame got no guide
+    std::optional<u64> oot_guide_frame;
+    VkImageView oot_guide_scene{}; ///< oot_guide_frame's scene before the HUD (linear colour)
+    VkExtent2D oot_guide_scene_extent{};
+    VkImageView oot_guide_reference{}; ///< the tonemapped image oot_guide_scene was copied from
+    std::optional<u64> oot_tonemapped_frame; ///< oot_tonemapped_view is this frame's, drawn whole
+    VkImageView oot_tonemapped_view{};
+    VkExtent2D oot_tonemapped_extent{};
     std::optional<u64> oot_effects_frame;
     GPUVAddr oot_effects_address{};
     VkImageView oot_effects_scene{};
@@ -355,9 +403,16 @@ private:
     } oot_actor, oot_previous_actor;
     u64 render_trace_frame = 0;
     u32 render_trace_draws = 0;
+    /// The topology UpdateDynamicStates gives the draw (see there).
+    VkPrimitiveTopology dynamic_host_topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
     u32 render_trace_clears = 0;
     bool pending_native_work{};
+    u64 budget_defer_tick{}; ///< The submission DeferBudgetFlush last deferred
+    u32 budget_deferrals{};  ///< and how many times
+    bool deferred_wfi_query_sync{}; ///< WaitForIdle skipped the query sync (EDEN_NX2_DEFER_WFI)
     bool mesh_draw{}; ///< the draw being prepared uses a task/mesh pipeline
+    /// The draw being recorded as an alpha-test prepass split (EDEN_NX2_PREPASS_HASHES), if it is
+    PrepassDraw prepass_draw;
     /// Fragment output components the dynamic color write mask was last recorded with
     u32 last_color_output_mask{};
     VideoCommon::OotNetwork::BypassState oot_network_bypass;

@@ -70,8 +70,8 @@ void EmitSetAttributeIndexed(EmitContext& ctx, Id offset, Id value, Id vertex);
 Id EmitGetPatch(EmitContext& ctx, IR::Patch patch);
 void EmitSetPatch(EmitContext& ctx, IR::Patch patch, Id value);
 Id EmitIsbeRead(EmitContext& ctx, Id address);
-void EmitIsbeWriteAttribute(EmitContext& ctx, Id address, Id value);
-void EmitIsbeWriteMapU8(EmitContext& ctx, Id address, Id value);
+void EmitIsbeWriteAttribute(EmitContext& ctx, const IR::Value& address, Id value);
+void EmitIsbeWriteMapU8(EmitContext& ctx, const IR::Value& address, Id value);
 void EmitIsbeWriteMapU32(EmitContext& ctx, const IR::Value& address, Id value);
 void EmitMeshPrologue(EmitContext& ctx);
 void EmitMeshEpilogue(EmitContext& ctx);
@@ -108,9 +108,9 @@ void EmitLoadGlobalU8(EmitContext& ctx);
 void EmitLoadGlobalS8(EmitContext& ctx);
 void EmitLoadGlobalU16(EmitContext& ctx);
 void EmitLoadGlobalS16(EmitContext& ctx);
-Id EmitLoadGlobal32(EmitContext& ctx, Id address);
-Id EmitLoadGlobal64(EmitContext& ctx, Id address);
-Id EmitLoadGlobal128(EmitContext& ctx, Id address);
+Id EmitLoadGlobal32(EmitContext& ctx, IR::Inst* inst, Id address);
+Id EmitLoadGlobal64(EmitContext& ctx, IR::Inst* inst, Id address);
+Id EmitLoadGlobal128(EmitContext& ctx, IR::Inst* inst, Id address);
 void EmitWriteGlobalU8(EmitContext& ctx);
 void EmitWriteGlobalS8(EmitContext& ctx);
 void EmitWriteGlobalU16(EmitContext& ctx);
@@ -655,5 +655,7 @@ void PatchCooperativeHmma(std::vector<u32>& code, const CooperativeHmmaTypes& ty
 /// Appends the shared memory of the 16x16x16 HMMA path to a program that runs it, and returns the
 /// word where it starts.
 std::optional<u32> ReserveCooperativeHmmaScratch(const Profile& profile, IR::Program& program);
+/// The same for the scratch of the software helpers, in a program that gathers through it.
+std::optional<u32> ReserveSoftwareMatrixScratch(const Profile& profile, IR::Program& program);
 
 } // namespace Shader::Backend::SPIRV

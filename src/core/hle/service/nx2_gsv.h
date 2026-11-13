@@ -33,6 +33,7 @@
 #include "common/game_presets.h"
 #include "common/memory_detect.h"
 #include "common/scope_exit.h"
+#include "common/power_tuning.h"
 #include "common/settings.h"
 #include "common/thread.h"
 #include "core/core.h"
@@ -45,6 +46,7 @@
 #include "core/perf_stats.h"
 #include "video_core/gpu.h"
 #include "video_core/gpu_split.h"
+#include "video_core/frame_budget.h"
 #include "video_core/framebuffer_config.h"
 #include "core/core_timing.h"
 #include "core/hle/kernel/k_client_session.h"
@@ -625,6 +627,9 @@ private:
             LOG_DEBUG(Service, "nx2:gpu 102 destroy handle={} [{:#x}, +{:#x}] slot={}", handle,
                       address, size, w[3]);
             if (size != 0) {
+                // The registry's listener calls wait for the GPU thread, whose back takes
+                // m_region_mutex in BackSparseWrite: they run once the lock is released.
+                const Nvidia::Devices::Nx2GpuMemoryRegistry::DeferScope defer;
                 std::scoped_lock lk{m_region_mutex};
                 std::vector<std::pair<u64, u64>> tiles;
                 for (const auto& [tile_address, tile] : m_gpu_only_tiles) {
@@ -680,6 +685,7 @@ private:
                  w[1], w[2], w[3], w[4], w[5], w[6], w[7], w[8], w[9], w[10], w[11], w[12]);
         if (last > start && ((last + 1 - start) % Core::Memory::LICHII_PAGESIZE) == 0) {
             const u64 size = last + 1 - start;
+            const Nvidia::Devices::Nx2GpuMemoryRegistry::DeferScope defer; // as in 102
             const bool lazy_sparse = (w[7] & SparseRegionFlag) != 0 && LazySparseRegions();
             const bool back_whole =
                 !lazy_sparse && (!LazyGpuOnlyRegions() || KeepsConstantsInGpuOnlyRegions());
@@ -779,6 +785,7 @@ private:
             rb.Push(ResultSuccess);
             return;
         }
+        const Nvidia::Devices::Nx2GpuMemoryRegistry::DeferScope defer; // as in 102
         std::vector<GpuOnlyRegion> freed;
         SCOPE_EXIT {
             FreeBackings(std::move(freed));
@@ -813,13 +820,17 @@ private:
                     region->second.cpu_address, region->second.size);
                 if (!done) {
                     done = std::make_shared<std::atomic<bool>>(false);
-                    system.GPU().RunInOrder([done] { done->store(true, std::memory_order_release); });
+                    Nvidia::Devices::Nx2GpuMemoryRegistry::Defer([this, done] {
+                        system.GPU().RunInOrder(
+                            [done] { done->store(true, std::memory_order_release); });
+                    });
                 }
                 m_released_regions.push_back({std::move(region->second), done});
                 region = m_gpu_only_regions.erase(region);
             }
         }
-        SignalAfterGpu(w[8]);
+        // Behind the unmaps above, outside m_region_mutex.
+        Nvidia::Devices::Nx2GpuMemoryRegistry::Defer([this, slot = w[8]] { SignalAfterGpu(slot); });
         IPC::ResponseBuilder rb{ctx, 2};
         rb.Push(ResultSuccess);
     }
@@ -838,6 +849,7 @@ private:
         std::vector<u8> kinds(count);
         std::vector<GpuOnlyRegion> freed;
         {
+            const Nvidia::Devices::Nx2GpuMemoryRegistry::DeferScope defer; // as in 102
             std::scoped_lock lk{m_region_mutex};
             freed = TakeReleasedRegions();
             ++m_tile_calls;
@@ -993,8 +1005,12 @@ private:
             Nvidia::Devices::Nx2GpuMemoryRegistry::Get().ReleaseBacking(it->second.cpu_address,
                                                                         it->second.size);
             auto done = std::make_shared<std::atomic<bool>>(false);
-            system.GPU().RunInOrder([done] { done->store(true, std::memory_order_release); });
+            // Behind the release above (held back while a DeferScope is open).
+            Nvidia::Devices::Nx2GpuMemoryRegistry::Defer([this, done] {
+                system.GPU().RunInOrder([done] { done->store(true, std::memory_order_release); });
+            });
             // Counted out by FreeBackings once its pages are freed.
+            m_gpu_only_bytes -= it->second.size;
             m_released_regions.push_back({std::move(it->second), done});
             m_gpu_only_regions.erase(it);
         }
@@ -1529,7 +1545,11 @@ private:
                                                                         backing->second.size);
             if (!done) {
                 done = std::make_shared<std::atomic<bool>>(false);
-                system.GPU().RunInOrder([done] { done->store(true, std::memory_order_release); });
+                // Behind the tile unmap above, held back with it (216's DeferScope).
+                Nvidia::Devices::Nx2GpuMemoryRegistry::Defer([this, done] {
+                    system.GPU().RunInOrder(
+                        [done] { done->store(true, std::memory_order_release); });
+                });
             }
             released += backing->second.size;
             m_released_regions.push_back({std::move(backing->second), done});
@@ -1689,6 +1709,7 @@ private:
     std::jthread m_cold_hint_thread{[this](std::stop_token stop) {
         Common::SetCurrentThreadName("nx2:ColdHint");
         Common::SetCurrentThreadPriority(Common::ThreadPriority::Low);
+        Common::PowerTuning::TagBackgroundThread();
         while (!stop.stop_requested()) {
             for (int i = 0; i < 30 && !stop.stop_requested(); ++i) {
                 std::this_thread::sleep_for(std::chrono::seconds{1});
@@ -2080,6 +2101,9 @@ private:
         const auto composited = std::chrono::steady_clock::now();
         PaceToVblank(w[12], ctx.GetThread().GetOwnerProcess());
         const auto paced = std::chrono::steady_clock::now();
+        // EDEN_NX2_TARGET_FPS: the frame time without the pacing wait steers the game's dynamic
+        // resolution. One atomic load without a target.
+        VideoCore::FrameBudget::OnGuestPresent(composited, paced);
         if (const auto* const process = system.ApplicationProcess(); process != nullptr) {
             UpdateFrameInterval(*process, entered);
         }
@@ -2433,7 +2457,10 @@ private:
         const bool timer_paced = Nx2VsyncRateHz() != 60;
         const bool speed_limited = !timer_paced && Settings::values.use_speed_limit.GetValue() &&
                                    Settings::SpeedLimit() != 0;
-        if (!speed_limited && fps_limit == 0) {
+        // EDEN_NX2_TARGET_FPS: presents are held to the target's interval, as by an FPS limit,
+        // so a frame that is done early still takes the whole interval.
+        const std::chrono::nanoseconds budget_interval = VideoCore::FrameBudget::PresentInterval();
+        if (!speed_limited && fps_limit == 0 && budget_interval.count() == 0) {
             Tegra::g_nx2_guest_frame_interval_ns.store(0, std::memory_order_relaxed);
             return;
         }
@@ -2447,7 +2474,11 @@ private:
                         : std::chrono::nanoseconds{100'000'000'000LL * swap_interval /
                                                    refresh_rate /
                                                    (speed_limited ? Settings::SpeedLimit() : 100)};
-        const auto interval = PacedInterval(vblank_interval, fps_limit);
+        // A frame budget alone does not bring back the vblank pacing a lifted speed limit took.
+        const std::chrono::nanoseconds limited_interval =
+            (speed_limited || fps_limit != 0) ? PacedInterval(vblank_interval, fps_limit)
+                                              : std::chrono::nanoseconds{0};
+        const auto interval = (std::max)(limited_interval, budget_interval);
         Tegra::g_nx2_guest_frame_interval_ns.store(
             static_cast<u64>(
                 std::chrono::duration_cast<std::chrono::nanoseconds>(interval).count()),

@@ -269,7 +269,8 @@ ComputePipeline::ComputePipeline(const Device& device_, Scheduler& scheduler, vk
                                    info.uses_subgroup_vote || info.uses_subgroup_invocation_id ||
                                    info.uses_subgroup_shuffles || info.uses_subgroup_mask ||
                                    info.uses_quad_shuffles || info.uses_fswzadd ||
-                                   info.uses_cooperative_matrix;
+                                   info.uses_cooperative_matrix ||
+                                   info.uses_subgroup_shared_scratch;
         VkPipelineCreateFlags flags{};
         if (device.IsKhrPipelineExecutablePropertiesEnabled() && Settings::values.renderer_debug.GetValue()) {
             flags |= VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR;
@@ -280,6 +281,9 @@ ComputePipeline::ComputePipeline(const Device& device_, Scheduler& scheduler, vk
         if (BuildsUnoptimized(device.GetDriverID(), shader_hash)) {
             flags |= VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT;
         }
+        // EDEN_NX2_PIPELINE_STATS: the driver keeps what its compiler reports for this build.
+        const VkPipelineCreateFlags capture_flags{PipelineExecutableDump::CaptureFlags(device)};
+        flags |= capture_flags;
         const VkComputePipelineCreateInfo compute_ci{
             .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
             .pNext = nullptr,
@@ -290,7 +294,7 @@ ComputePipeline::ComputePipeline(const Device& device_, Scheduler& scheduler, vk
                                  device.IsGuestWarpSizeSupported(VK_SHADER_STAGE_COMPUTE_BIT)
                              ? &subgroup_size_ci
                              : nullptr,
-                .flags = info.uses_cooperative_matrix
+                .flags = info.uses_cooperative_matrix || info.uses_subgroup_shared_scratch
                              ? VkPipelineShaderStageCreateFlags{
                                    VK_PIPELINE_SHADER_STAGE_CREATE_REQUIRE_FULL_SUBGROUPS_BIT}
                              : VkPipelineShaderStageCreateFlags{},
@@ -308,10 +312,14 @@ ComputePipeline::ComputePipeline(const Device& device_, Scheduler& scheduler, vk
             const bool unoptimized = (flags & VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT) != 0;
             const auto trace_begin = std::chrono::steady_clock::now();
             TracePipelineBuild("BEGIN", "compute", shader_hash, traced, unoptimized);
+            // A capturing build takes no driver pipeline cache, so that its statistics come
+            // from a compile (the binary store is not opened then: PipelineCache).
+            const VkPipelineCache driver_cache{
+                capture_flags != 0 ? VkPipelineCache{VK_NULL_HANDLE} : *pipeline_cache};
             pipeline = binaries ? binaries->CreateComputePipeline(compute_ci, *pipeline_cache,
                                                                   binary_key)
                                 : device.GetLogical().CreateComputePipeline(compute_ci,
-                                                                            *pipeline_cache);
+                                                                            driver_cache);
             TracePipelineBuild("END", "compute", shader_hash, traced, unoptimized,
                                std::chrono::duration<double, std::milli>(
                                    std::chrono::steady_clock::now() - trace_begin)
@@ -338,6 +346,18 @@ ComputePipeline::ComputePipeline(const Device& device_, Scheduler& scheduler, vk
 
         if (pipeline_statistics) {
             pipeline_statistics->Collect(device, *pipeline);
+        }
+        if (capture_flags != 0 && pipeline) {
+            const std::array<u64, 1> stage_hashes{shader_hash};
+            PipelineExecutableDump::Record(device, *pipeline,
+                                           {
+                                               .kind = "compute",
+                                               .key_hash = binary_key,
+                                               .stage_hashes = stage_hashes,
+                                               .shader_hash = shader_hash,
+                                               .is_mesh = false,
+                                               .flags = flags,
+                                           });
         }
         // Nothing reads the module once the pipeline exists; the driver keeps its SPIR-V while it
         // lives.
@@ -412,8 +432,9 @@ void ComputePipeline::RunBuild() {
     build_task = nullptr;
 }
 
-bool ComputePipeline::CanReplaceOcarinaUpscale() const {
+bool ComputePipeline::CanReplaceOcarinaUpscale(bool output_pass) const {
     const bool known_shader =
+        output_pass ||
         shader_hash == 0xe40f5efb5480e692ULL || shader_hash == 0xef542df87cacfe9eULL ||
         shader_hash == Ocarina1440pShader ||
         shader_hash == OcarinaFullSizeShader;

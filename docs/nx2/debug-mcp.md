@@ -222,6 +222,170 @@ not list it.
 (`EDEN_NX2_HOSTTIMING_STATS`) on or off and returns the `previous` and current `stats` state.
 Read the lines with `log_tail` (`contains: "HostTiming wait"`).
 
+**`power`** `{window_ms?}`. Host power from the Windows Energy Meter Interface, averaged over
+`window_ms` (default 1000; 0 means since the previous call): `package_w`, `cpu_w` (cores, the
+`PP0` channel) and `gpu_w` (integrated GPU, `PP1`), with `valid` false when nothing was measured
+and `available` false when the host has no such meter. Also `process_cpu_cores` (the emulator's
+CPU time per wall time), `gpu_busy_ms` of the last sampled frame (null when not measured) and
+the switches below. `policy` and `governor` report the session power policy.
+
+`EDEN_NX2_POWER_POLICY=igpu` (Windows, integrated GPUs only, off by default) trades CPU power
+for GPU clock on a shared package power limit. At game boot it saves the active power scheme's
+processor performance boost mode and minimum processor state (both core classes, AC and DC),
+writes boost off and a 5% minimum, and writes the saved values back at game stop or exit. The
+saved values sit in `nx2_power_restore.txt` in the config directory meanwhile, so the next start
+restores them after a crash. `policy` has `active`, the `scheme`, each setting's `saved_*` and
+`applied_*` values and a `message` (why it is not active: a host that refuses the calls is left
+alone). While it runs, a governor samples once a second and steps `spin_scale` down
+(1 -> 0.5 -> 0.25 -> 0) when the GPU is busy over 90% of a frame that is slower than the target
+and the cores take over half the package power, and back up when the GPU is busy under 70%.
+`governor` has its `state` (`gpu_bound`, `cpu_bound`, `balanced`, `no_data`), inputs and
+`last_change`. The target is `EDEN_NX2_POWER_POLICY_FPS`, else the `EDEN_NX2_TARGET_FPS` target,
+else the `EDEN_NX2_VRS_AUTO` target, else 30.
+
+**`power_set`** `{spin_scale?, eco_background?, idle_spin_us?}`. Sets the power switches live
+and returns all three. `spin_scale` (0 to 1, `EDEN_NX2_SPIN_SCALE`) scales the busy-wait bounds
+of the GPU front and back threads; 0 blocks at once. `eco_background`
+(`EDEN_NX2_ECO_BACKGROUND=1`) puts the background workers (shader jobs, pipeline serialization,
+texture decoder, ZeroTrim, ColdHint) on EcoQoS on Windows; it only reaches threads that start
+afterwards, so set the variable to cover a whole session. `idle_spin_us`
+(`EDEN_NX2_IDLE_SPIN_US`) is how long an idle guest core polls before blocking, -1 for the
+per-title default.
+
+**`frame_budget`** `{target_fps?, scale?}`. The frame budget controller
+(`EDEN_NX2_TARGET_FPS=<fps>` at launch, off without it; not compiled or run yet). It holds a
+Switch 2 title that sizes its own dynamic resolution from GPU time (Ocarina of Time without the
+Max Resolution add-on) at a frame rate, in two parts:
+
+- Cadence. The nx2:vi2 present pacer (`PaceToVblank`, the one behind the FPS limit) holds every
+  guest present until the last deadline plus `1 / target`, so a frame that is done early still
+  takes the whole interval. A frame that is late is not held, and the pacer starts over from a
+  present more than one interval late.
+- Resolution. Every half second of presents is one tick. Its input is `work_ms`: the time from
+  one present's return to the next present's pacing wait, the frame without that wait, as four
+  frames in five of the tick stay under (the 80th percentile: a median would pass a tick with
+  two late frames in five; `frame_ms` is the median present interval). Above `target * 1.04`
+  the GPU time scale (`EDEN_NX2_GPU_TIME_SCALE`, `AmpereTimeSincePresent`) is multiplied by
+  1.25, at every such tick: the game measures more GPU time and renders lower. Below
+  `target * 0.90` for four ticks in a row it is multiplied by 0.92: the game renders higher.
+  Between the two nothing moves.
+
+A game that starts its frames on the nx2:vi2 vsync event waits for the next event after a held
+present returns, and that wait counts as frame time: with the event at 60 Hz up to 16.7 ms of
+headroom can stay hidden (`work_ms` near `frame_ms` although the GPU idles), and the scale is
+then lowered later than it could be. A faster event (`nx2_frame_rate_limit` 120 or 240, for a
+game that keeps its speed there) shortens the wait.
+
+The scale stays between 0.05 and the smaller of 4 and the GPU Clocks divisor (Normal 1, Boost
+4, Overclock 16): the time a title sees never exceeds the real time, so a larger scale changes
+nothing. The scale is latched with each present (`AmpereAnchor`), so a change never moves a
+timestamp back within a frame. `state` is what the last tick found:
+
+| `state` | Meaning |
+|---|---|
+| `off` | No target, or no tick yet |
+| `frozen` | Fewer than three presents in the tick, or frames over four targets long (a loading screen): nothing moves |
+| `on_target` | Inside the band |
+| `slow` | A miss: the scale was raised |
+| `saturated` | A miss with the scale at its upper limit: the game has no resolution left to give |
+| `fast` | Headroom: counting towards a lower, just lowered, or at the lowest scale |
+| `cooldown` | Headroom, but the next lower scale is below the one that last missed |
+| `no_effect` | Headroom, but eight lowers in a row left the frame time alone (the game is at its highest resolution, or does not follow the scale); they go on once frames are 8% slower |
+| `waiting` | Headroom, but the shading-rate governor gives its coarse rates back first |
+
+The scale at which a run of misses began is `miss_scale`: for `cooldown_ticks` more ticks
+(30, doubled up to 240 each time a lower made since brings a miss back) a lower stays one step
+above it, so the scale does not go back and forth over a resolution step. It is forgotten after
+two cool-downs without a miss.
+
+With `EDEN_NX2_VRS_AUTO` on, the shading-rate governor takes the same target and its frame time
+without the pacing wait. It may coarsen only from a miss at the scale's upper limit until the
+scale leaves that limit (`shading_rate_allowed`; `set_shading_rate` shows `auto.allowed` and the
+hold reason), and while it holds coarse rates the scale is not lowered.
+
+`target_fps` sets the target live (1 to 1000; 0 turns the controller off and puts the scale back
+to `manual_scale`). `scale` sets the scale by hand; with a target the controller goes on from
+it. The reply also has `target_ms`, `samples` (presents of the last tick), `scale`,
+`latched_scale` (the scale as the anchor keeps it, within 0.8%), `min_scale`, `max_scale`,
+`ticks`, `raises`, `lowers`, `fast_streak`, `blind_lowers` and `last_change`. A change of the
+scale by more than 10% logs one `Frame budget:` line, at most one a second.
+
+**`gpu_costs`** `{top?, enable?}`. Host GPU time of the last sampled frame (one a second, the
+`DKB gpu_work` and `DKB gpu_pass` data without the log lines): `work` per vertex+fragment or
+compute shader hash and `passes` per render target, slowest first, `top` of each (default 32).
+`enable` turns the sampling on or off (`EDEN_NX2_COST_SAMPLING=1` starts with it on); `frame` is
+0 until a frame was sampled, `age_ms` says how old the sample is. Each `work` entry also counts
+its `small_draws` (direct draws of at most 6 vertices and one instance) and `side_draws` (draws
+into another target than the main scene target: the one with depth and colour whose draws took
+the most time, `has_main_target`).
+What the driver's compiler made of those shaders is a launch option, not a tool:
+`EDEN_NX2_PIPELINE_STATS=<dir>` enables VK_KHR_pipeline_executable_properties, builds every guest
+graphics and compute pipeline with `VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR` and appends one
+JSON line per build to `<dir>/pipeline_stats.jsonl`: `kind` (`graphics` or `compute`), `pipeline`
+(the key's hash), `hashes` (the six stage hashes, or the compute hash), `shader` (fragment or
+compute hash), `mesh`, `flags` (the create flags) and `executables`, each with `index`, `name`,
+`description`, `stages` (a `VkShaderStageFlags` mask), `subgroup_size` and `statistics` (`name`,
+`description`, `format`, `value`). `EDEN_NX2_PIPELINE_STATS_IR=1` adds the capture of internal
+representations: each executable gets `representations` (`name`, `description`, `text`, `bytes`,
+`file`) and the text ones are written as `<dir>/<shader>_<index>_<name>.txt`, once per file name.
+Such a session leaves the driver blob store closed, passes no driver pipeline cache to its builds
+and marks nothing as precached, so it compiles everything again and its frame times mean nothing;
+the shader cache's own records are used and written as usual. Save a `gpu_costs` reply from a
+normal session, then `python3 -I tools/nx2/pipeline_stats.py <dir> --costs <reply.json>` (or a log
+with `DKB gpu_work` lines) prints the executables of the costliest shaders, with the statistics
+named after spills, fills, scratch space, SIMD or dispatch width, instructions, sends, cycles and
+loops marked.
+**`set_shading_rate`** `{hashes?, rate?, all?}`. With `EDEN_NX2_VRS` set at launch, every guest
+graphics pipeline takes its fragment shading rate (VK_KHR_fragment_shading_rate) as dynamic
+state. This sets the fragment size (`1x1`, `2x1`, `1x2`, `2x2`, `4x2`, `2x4`, `4x4`; `2x2` when
+omitted) for the draws of the listed fragment shader hashes, from the next draw on, or with
+`all: true` for every shader not listed. `1x1` restores. Without hashes it returns the table.
+`EDEN_NX2_VRS_HASHES=<hash>:<rate>,...` and `EDEN_NX2_VRS_DEFAULT=<rate>` set the same table at
+boot. Rates are clamped to the device's.
+
+`auto: <fps>` starts the automatic governor and `auto: 0` stops it (`EDEN_NX2_VRS_AUTO=<fps>` at
+launch, with `EDEN_NX2_VRS`). It turns cost sampling on and, on each sampled frame, compares the
+median guest present interval of the last second (frames the host generates are not counted)
+with the target: after two slow samples the costliest fragment shader goes one level coarser
+(`2x1`, `2x2`; `EDEN_NX2_VRS_AUTO_MAX=3` allows `4x4`), after four fast ones the last raise is
+taken back. Its table is a layer under the manual one: a hash in `rates` or a non-`1x1` default
+always wins, and the governor never touches them. It leaves alone fragment shaders that write
+depth, that only draw small direct draws (full-screen and UI quads), that only draw into side
+targets, and the hashes of `auto_deny` (`EDEN_NX2_VRS_AUTO_DENY=<hash>,...`; `auto_allow`
+removes them). The reply's `auto` has the target, the measured `frame_ms`, the layer (`rates`,
+`levels`), the `denied` lists, `last_action` and `hold_reason`. A raise or lower logs one
+`VRS auto:` line.
+**`set_prepass`** `{hashes?, on?}`. Experiment (`EDEN_NX2_PREPASS_HASHES=<hash>,...` at boot):
+the draws of the listed fragment shader hashes are drawn twice, first with a depth-only form of
+the fragment shader that keeps only what decides its discards, then with the fragment shader
+itself, early fragment tests on, depth compared for equality and not written. The shader then
+runs once for each visible pixel instead of once for each layer of alpha-tested geometry. A
+pipeline takes the split when its fragment shader discards (or the alpha test is on), writes no
+depth, sample mask or storage, no earlier stage writes storage, and there is a depth buffer, no
+forced early depth test, transform feedback, alpha to coverage or alpha to one. A draw is split
+when depth test and write are on with a less, less-equal, greater or greater-equal compare, and
+stencil test, blending of every bound colour target, logic op, transform feedback and the
+samples-passed counter are off. `Prepass split:` log lines name the pipelines refused and why,
+and the state of the first draws refused. `EDEN_NX2_PREPASS_FORCE=1` at launch takes the split
+with an earlier stage that writes storage (it then writes twice) and with the counter on (it
+counts the visible fragments once more). `on: false` takes the hashes off the list, from the
+next draw on; listing some drops their built pipelines at the next frame end, to be made again
+with the split when next drawn (pipelines still building then, or prebuilt and not yet drawn,
+keep drawing in one pass: take the hash off and list it again). Without hashes it returns the
+list. The reply counts
+the `pipelines` built with the split and their `split_draws` and `plain_draws` (state refused).
+Both passes use the same shader modules before the fragment stage; should their depths still
+differ (holes in the geometry), `EDEN_NX2_PREPASS_INVARIANT=1` at launch decorates Position as
+invariant in those pipelines.
+**`memory`**. Host memory in bytes. `process`: working set, private working set, commit and their
+peaks. `system`: commit against its limit, RAM and free RAM. `guest`: the guest memory's size,
+what stayed resident after the last zero-page trim, zero pages trimmed and zero-filled so far, and
+bytes committed on demand (`EDEN_NX2_LAZY_GUEST_COMMIT=1`). `renderer`: device memory in use
+against the texture cache thresholds, buffer cache, staging buffers, mesh arenas, graphics
+pipelines (entries, built, kept limit) and kept SPIR-V; pipeline figures refresh every 600 frames.
+`low_memory_mode` says whether `EDEN_NX2_LOW_MEMORY` or the host's RAM (20 GiB or less) turned
+the smaller cache limits on.
+
 **`reject_shaders`** `{hashes?, reject?, timeout_s?}`. This is `EDEN_NX2_REJECT_HASH` at
 runtime: the same keys (native program key or shader hash) and the same effect. Pipeline
 invalidation turned out to be tractable:

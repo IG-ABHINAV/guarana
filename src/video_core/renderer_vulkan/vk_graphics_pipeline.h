@@ -30,6 +30,7 @@
 #include "video_core/renderer_vulkan/vk_descriptor_pool.h"
 #include "video_core/renderer_vulkan/vk_texture_cache.h"
 #include "video_core/renderer_vulkan/vk_update_descriptor.h"
+#include "video_core/texture_cache/draw_template.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 
 namespace VideoCore {
@@ -112,6 +113,23 @@ struct MeshEmulationSetup {
     std::array<u32, 4> position_lines{~0U, ~0U, ~0U, ~0U}; ///< line of PositionX..W
 };
 
+/// Alpha-test prepass split (EDEN_NX2_PREPASS_HASHES): the fragment program's two other shaders,
+/// emitted with the pipeline's stages. A draw of such a pipeline is recorded as a depth pass with
+/// `depth_only`, then a colour pass at equal depth with `early_test` (PrepassDraw).
+struct PrepassShaders {
+    std::vector<u32> depth_only; ///< no colour outputs: only what decides a discard is left
+    std::vector<u32> early_test; ///< the fragment shader with early fragment tests
+    /// The stages before the fragment one decorate Position as Invariant
+    /// (EDEN_NX2_PREPASS_INVARIANT), which makes them other shaders than without the split.
+    bool invariant_position{};
+};
+/// The sampled textures and image descriptors of a draw, kept across frames (ConfigureImpl).
+using DrawTemplate =
+    VideoCommon::DrawTemplate<DescriptorUpdateEntry,
+                              Tegra::Engines::Maxwell3D::Regs::MaxShaderStage,
+                              Shader::Backend::SPIRV::NUM_TEXTURE_AND_IMAGE_SCALING_WORDS>;
+using DrawTemplates = VideoCommon::DrawTemplateTable<DrawTemplate>;
+
 /// What an evicted graphics pipeline needs to be built again without translating its shaders
 struct KeptGraphicsStages {
     static constexpr size_t NUM_STAGES = Tegra::Engines::Maxwell3D::Regs::MaxShaderStage;
@@ -132,15 +150,16 @@ public:
     explicit GraphicsPipeline(
         Scheduler& scheduler, BufferCache& buffer_cache, TextureCache& texture_cache,
         vk::PipelineCache& pipeline_cache, PipelineBinaries* binaries,
-        VideoCore::ShaderNotify* shader_notify,
-        const Device& device, DescriptorPool& descriptor_pool,
-        GuestDescriptorQueue& guest_descriptor_queue,
-        DescriptorBufferRing& descriptor_buffer_ring, const PipelineBuildQueue& build_queue,
-        PipelineStatistics* pipeline_statistics, RenderPassCache& render_pass_cache,
-        const GraphicsPipelineCacheKey& key, std::array<std::vector<u32>, NUM_STAGES> stages,
+        VideoCore::ShaderNotify* shader_notify, const Device& device,
+        DescriptorPool& descriptor_pool, GuestDescriptorQueue& guest_descriptor_queue,
+        DescriptorBufferRing& descriptor_buffer_ring, DrawTemplates& draw_templates,
+        const PipelineBuildQueue& build_queue, PipelineStatistics* pipeline_statistics,
+        RenderPassCache& render_pass_cache, const GraphicsPipelineCacheKey& key,
+        std::array<std::vector<u32>, NUM_STAGES> stages,
         const std::array<const Shader::Info*, NUM_STAGES>& infos,
         std::function<std::array<std::vector<u32>, NUM_STAGES>()> emit_stages = {},
-        std::optional<MeshEmulationSetup> mesh_emulation = std::nullopt);
+        std::optional<MeshEmulationSetup> mesh_emulation = std::nullopt,
+        std::shared_ptr<PrepassShaders> prepass_shaders = nullptr);
 
     static std::chrono::nanoseconds TakeHoldTime() noexcept;
     /// Draws resolved from the texture memo and in full since the last call.
@@ -187,9 +206,32 @@ public:
         return key.state.extended_dynamic_state != 0;
     }
 
+    /// The colour write masks are dynamic state (VK_EXT_extended_dynamic_state3).
+    bool UsesDynamicColorWriteMask() const noexcept {
+        return key.state.extended_dynamic_state_3_blend != 0;
+    }
+
+    /// Made with the shaders of an alpha-test prepass split (PrepassShaders), and once built, with
+    /// the two passes' pipelines: its draws can be recorded as two passes when the draw's state
+    /// allows it too.
+    [[nodiscard]] bool HasPrepassSplit() const noexcept {
+        return prepass_split && (!IsBuilt() || prepass_pipelines[1]);
+    }
+
+    /// Worker thread, once built: the pipelines of the split's depth pass and colour pass. Null
+    /// handles when they could not be built.
+    [[nodiscard]] std::array<VkPipeline, 2> PrepassPipelines() const noexcept {
+        return {*prepass_pipelines[0], *prepass_pipelines[1]};
+    }
+
     /// Switch 2 task/mesh pipeline: drawn with vkCmdDrawMeshTasksEXT.
     [[nodiscard]] bool IsMeshPipeline() const noexcept {
         return stage_infos[0].is_task || stage_infos[0].is_mesh;
+    }
+
+    /// Has tessellation control and evaluation stages: drawn as a patch list.
+    [[nodiscard]] bool HasTessellation() const noexcept {
+        return has_tessellation;
     }
 
     /// Mesh pipeline drawn through the compute emulation (MeshEmulationSetup).
@@ -289,6 +331,21 @@ public:
     void SetMappedPointers(VideoCommon::EvictedPointerSlots::Slots slots) noexcept {
         mapped_pointers = std::move(slots);
     }
+
+    /// Mesh pipeline whose mesh program reads the viewport for its small triangle test
+    /// (Shader::RuntimeInfo::mesh_cull).
+    [[nodiscard]] bool UsesMeshCullViewport() const noexcept {
+        return std::ranges::any_of(stage_infos, &Shader::Info::uses_mesh_cull_viewport);
+    }
+
+    /// Mesh pipeline whose mesh program may write a per-primitive shading rate
+    /// (Shader::RuntimeInfo::mesh_out).
+    [[nodiscard]] bool UsesMeshShadingRate() const noexcept {
+        return std::ranges::any_of(stage_infos, &Shader::Info::uses_mesh_shading_rate);
+    }
+
+    /// Records viewport 0 (x, y, width, height in host pixels) for that test.
+    void PushMeshCullViewport(const std::array<f32, 4>& viewport);
 
     /// Moves out the SPIR-V kept after the build, with the stage infos: for a built pipeline being
     /// evicted
@@ -406,10 +463,34 @@ private:
 
     void KeepImageDescriptors(size_t stage, size_t first_entry);
 
+    /// Keeps the draw's textures and image descriptors, which the guest descriptor queue holds
+    /// at `ranges`, for later draws with the same key. With `verified`, the template the key
+    /// found is compared with them first (EDEN_NX2_DRAW_TEMPLATE_VERIFY).
+    void KeepDrawTemplate(DrawTemplate* verified, const VideoCommon::DrawTemplateContext& context,
+                          std::span<const u32> handles, u64 hash,
+                          std::span<const VideoCommon::TextureHandleRead> reads,
+                          std::span<const VideoCommon::ImageViewInOut> views,
+                          std::span<const VideoCommon::SamplerId> samplers,
+                          const std::array<std::pair<u32, u32>, NUM_STAGES>& ranges,
+                          const RescalingPushConstant& rescaling);
+
     bool ConfigureDraw(const RescalingPushConstant& rescaling,
                        const RenderAreaPushConstant& render_are);
 
-    void MakePipeline(VkRenderPass render_pass);
+    /// The pipeline itself, or one of the two an alpha-test prepass split draws with: the depth
+    /// pass (the depth-only fragment shader, no colour written) and the colour pass (the fragment
+    /// shader with early fragment tests, depth compared for equality and not written).
+    enum class PipelineVariant : u8 {
+        Main,
+        PrepassDepth,
+        PrepassColor,
+    };
+
+    void MakePipeline(VkRenderPass render_pass, PipelineVariant variant = PipelineVariant::Main);
+
+    /// Builds the split's two pipelines after the pipeline itself, from the same modules for the
+    /// stages before the fragment one. A failure leaves the pipeline without them.
+    void MakePrepassPipelines(VkRenderPass render_pass);
 
     void Validate();
 
@@ -424,6 +505,10 @@ private:
     Scheduler& scheduler;
     GuestDescriptorQueue& guest_descriptor_queue;
     DescriptorBufferRing& descriptor_buffer_ring;
+    DrawTemplates& draw_templates;
+    const u64 template_owner;
+    VideoCommon::DrawTemplateRecorder template_recorder;
+    u64 last_template_context{}; ///< Hash of the last kept template's context (verify, profile)
 
     bool (*configure_func)(GraphicsPipeline*, bool){};
 
@@ -444,11 +529,12 @@ private:
     size_t num_image_elements{};
     std::vector<SampledImage> sampled_images;
     u32 num_textures{};
+    bool has_tessellation{};
     bool fragment_has_color0_output{};
     u32 color_output_mask{};
     bool writes_storage{};
     /// Every texture is sampled with a handle read from a constant buffer: ConfigureImpl can
-    /// resolve them from texture_memo.
+    /// resolve them from texture_memo or a draw template.
     bool texture_memo_eligible{};
     VideoCommon::SampledTextureMemo texture_memo;
     bool writes_images{};
@@ -527,7 +613,56 @@ private:
     std::array<MeshEmulationBuffer, 4> mesh_task_buffers{};
     u32 mesh_capacity{};
 
+    // Alpha-test prepass split: the shaders until the build has made their modules, and the
+    // pipelines of the depth pass [0] and the colour pass [1].
+    std::shared_ptr<PrepassShaders> prepass_shaders;
+    const bool prepass_split;
+    const bool prepass_invariant;
+    std::array<vk::ShaderModule, 2> prepass_modules;
+    std::array<vk::Pipeline, 2> prepass_pipelines;
+
     std::optional<PipelineBuild> build;
+};
+
+/// One draw of an alpha-test prepass split, captured by the draw's recorded command. Without a
+/// pipeline, or when the split's pipelines could not be built, it is the draw as recorded before.
+struct PrepassDraw {
+    const GraphicsPipeline* pipeline{};
+    bool dynamic_depth{};      ///< depth compare op and write enable are dynamic state
+    bool dynamic_color_mask{}; ///< the colour write masks are dynamic state
+    /// The draw's own colour write masks, set again for the colour pass
+    std::array<VkColorComponentFlags, Maxwell::NumRenderTargets> color_masks{};
+
+    /// Worker thread, with the draw's pipeline, descriptors and dynamic state bound. `draw`
+    /// records the draw call; it is called twice for a split.
+    template <typename Func>
+    void Draw(vk::CommandBuffer cmdbuf, Func&& draw) const {
+        std::array<VkPipeline, 2> passes{};
+        if (pipeline != nullptr) {
+            passes = pipeline->PrepassPipelines();
+        }
+        if (passes[0] == VK_NULL_HANDLE || passes[1] == VK_NULL_HANDLE) {
+            draw();
+            return;
+        }
+        static constexpr std::array<VkColorComponentFlags, Maxwell::NumRenderTargets> no_color{};
+        // Depth pass: the guest's depth test and write, nothing written to the colour targets.
+        cmdbuf.BindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS, passes[0]);
+        if (dynamic_color_mask) {
+            cmdbuf.SetColorWriteMaskEXT(0, no_color);
+        }
+        draw();
+        // Colour pass: only the fragments whose depth the first pass left in the buffer.
+        cmdbuf.BindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS, passes[1]);
+        if (dynamic_color_mask) {
+            cmdbuf.SetColorWriteMaskEXT(0, color_masks);
+        }
+        if (dynamic_depth) {
+            cmdbuf.SetDepthCompareOpEXT(VK_COMPARE_OP_EQUAL);
+            cmdbuf.SetDepthWriteEnableEXT(false);
+        }
+        draw();
+    }
 };
 
 } // namespace Vulkan

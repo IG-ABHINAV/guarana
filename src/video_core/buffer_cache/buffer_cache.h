@@ -19,6 +19,7 @@
 #include <vector>
 #include <fmt/ranges.h>
 
+#include "common/memory_detect.h"
 #include "common/range_sets.inc"
 #include "video_core/buffer_cache/buffer_cache_base.h"
 #include "video_core/buffer_cache/multi_range_refresh.h"
@@ -198,6 +199,7 @@ void BufferCache<P>::TickFrame() {
     if (runtime.CanReportMemoryUsage()) {
         total_used_memory = runtime.GetDeviceMemoryUsage();
     }
+    Common::g_memory_counters.buffer_cache_bytes.store(buffer_bytes, std::memory_order_relaxed);
     if (gpu_memory != nullptr && gpu_memory->UsesNativeTiling()) {
         // Switch 2 titles fill the device with textures (their collector watches the budget);
         // title 1's buffers were ~200 MiB of an 8 GB GPU's ~6.8 GB in use, yet this collector
@@ -205,8 +207,10 @@ void BufferCache<P>::TickFrame() {
         // downloading the GPU-written ones, ~5% of the GPU thread) that were recreated later.
         // Collect when the buffers themselves are large. At 1 GiB it held geometry of scenes
         // long gone: title 1's title screen grew to ~0.9 GB of buffers in ten minutes.
-        if (buffer_bytes >= 512_MiB) {
-            RunGarbageCollector(buffer_bytes >= 1_GiB);
+        const bool low_memory = Common::LowMemoryMode();
+        if (buffer_bytes >= (low_memory ? LOW_MEMORY_COLLECT_BYTES : NATIVE_COLLECT_BYTES)) {
+            RunGarbageCollector(buffer_bytes >=
+                                (low_memory ? LOW_MEMORY_CRITICAL_BYTES : NATIVE_CRITICAL_BYTES));
         }
     } else if (total_used_memory >= minimum_memory) {
         RunGarbageCollector(total_used_memory >= critical_memory);
@@ -1578,6 +1582,12 @@ std::pair<typename P::Buffer*, u32> BufferCache<P>::ObtainCPUBuffer(
     default:
         break;
     }
+    if constexpr (requires { runtime.TracksEveryUse(); }) {
+        // The caller's GPU work reads or writes these bytes without another call here.
+        if (runtime.TracksEveryUse()) {
+            buffer.MarkUsage(buffer.Offset(device_addr), size);
+        }
+    }
 
     return {&buffer, buffer.Offset(device_addr)};
 }
@@ -2497,10 +2507,18 @@ void BufferCache<P>::BindHostVertexBuffers() {
 
 template <class P>
 void BufferCache<P>::BindHostDrawIndirectBuffers() {
-    const auto bind_buffer = [this](const Binding& binding) {
+    bool tracks_every_use = false;
+    if constexpr (requires { runtime.TracksEveryUse(); }) {
+        tracks_every_use = runtime.TracksEveryUse();
+    }
+    const auto bind_buffer = [this, tracks_every_use](const Binding& binding) {
         Buffer& buffer = slot_buffers[binding.buffer_id];
         TouchBuffer(buffer, binding.buffer_id);
         SynchronizeBuffer(buffer, binding.device_addr, binding.size);
+        if (tracks_every_use) {
+            // The indirect draw reads these bytes with no other call here.
+            buffer.MarkUsage(buffer.Offset(binding.device_addr), binding.size);
+        }
     };
     if (current_draw_indirect->include_count) {
         bind_buffer(channel_state->count_buffer_binding);
@@ -3715,8 +3733,16 @@ BufferId BufferCache<P>::CreateBuffer(DAddr device_addr, u32 wanted_size, bool s
         slot_buffers.insert(runtime, overlap.begin, size, sparse_compatible);
     auto& new_buffer = slot_buffers[new_buffer_id];
     const size_t size_bytes = new_buffer.SizeBytes();
-    runtime.ClearBuffer(new_buffer, 0, size_bytes, 0);
-    new_buffer.MarkUsage(0, size_bytes);
+    bool cleared = false;
+    if constexpr (requires { runtime.ClearNewBufferDirect(new_buffer); }) {
+        // EDEN_NX2_UMA bit 2: zeroed through its mapping, the buffer has no pending GPU write
+        // and takes its first uploads directly.
+        cleared = runtime.ClearNewBufferDirect(new_buffer);
+    }
+    if (!cleared) {
+        runtime.ClearBuffer(new_buffer, 0, size_bytes, 0);
+        new_buffer.MarkUsage(0, size_bytes);
+    }
     for (const BufferId overlap_id : overlap.ids) {
         JoinOverlap(new_buffer_id, overlap_id, !overlap.has_stream_leap);
     }
@@ -3923,6 +3949,20 @@ void BufferCache<P>::MappedUploadMemory([[maybe_unused]] Buffer& buffer,
                                         [[maybe_unused]] u64 total_size_bytes,
                                         [[maybe_unused]] std::span<BufferCopy> copies) {
     if constexpr (USE_MEMORY_MAPS) {
+        if constexpr (requires { runtime.DirectUploadTarget(buffer, copies); }) {
+            // EDEN_NX2_UMA bit 2: no pending GPU work uses these bytes of a host-mapped buffer.
+            if (u8* const direct_pointer = runtime.DirectUploadTarget(buffer, copies)) {
+                for (const BufferCopy& copy : copies) {
+                    const DAddr device_addr = buffer.CpuAddr() + copy.dst_offset;
+                    device_memory.ReadBlockUnsafe(device_addr, direct_pointer + copy.dst_offset,
+                                                  copy.size);
+                    if (copy.size >= 256_KiB) {
+                        uploaded_buffer_ranges.emplace_back(device_addr, copy.size);
+                    }
+                }
+                return;
+            }
+        }
         auto upload_staging = runtime.UploadStagingBuffer(total_size_bytes);
         const std::span<u8> staging_pointer = upload_staging.mapped_span;
         for (BufferCopy& copy : copies) {

@@ -374,6 +374,9 @@ struct Info {
     bool binds_unmapped_pointer_word{};
     /// Set by the SPIR-V backend when HMMA runs on cooperative matrices, which need full subgroups
     bool uses_cooperative_matrix{};
+    /// Set when software HMMA gathers from subgroup scratch in shared memory, which needs full
+    /// subgroups of the guest's 32 lanes
+    bool uses_subgroup_shared_scratch{};
     /// Native global accesses whose pointer is chosen at run time: every storage buffer descriptor
     /// is a candidate and its bound length (not an NVN size word) limits the range.
     bool native_global_bounds{};
@@ -382,6 +385,10 @@ struct Info {
     bool uses_rescaling_uniform{};
     bool uses_cbuf_indirect{};
     bool uses_render_area{};
+    /// Mesh program built with the small triangle test (RuntimeInfo::mesh_cull), set by the host
+    bool uses_mesh_cull_viewport{};
+    /// Mesh program asked to write a per-primitive shading rate (MESH_OUT_RATE), set by the host
+    bool uses_mesh_shading_rate{};
 
     IR::Type used_constant_buffer_types{};
     IR::Type used_storage_buffer_types{};

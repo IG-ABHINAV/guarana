@@ -5,6 +5,7 @@
 
 #pragma once
 
+#include <chrono>
 #include <memory>
 #include <string>
 #include <variant>
@@ -40,7 +41,8 @@ class GPU;
 namespace Vulkan {
 
 Device CreateDevice(const vk::Instance& instance, const vk::InstanceDispatch& dld,
-                    VkSurfaceKHR surface);
+                    VkSurfaceKHR surface,
+                    const std::function<void(const Device&)>& on_capabilities = {});
 
 class RendererVulkan final : public VideoCore::RendererBase {
 public:
@@ -84,6 +86,18 @@ public:
 
     [[nodiscard]] std::optional<double> GetGpuBusyMs() const override {
         return scheduler.GpuBusyMs();
+    }
+
+    bool RequestGpuCostSampling(bool on) override {
+        return scheduler.RequestCostSampling(on);
+    }
+
+    [[nodiscard]] bool IsGpuCostSampling() const override {
+        return scheduler.CostSampling();
+    }
+
+    [[nodiscard]] VideoCore::GpuCostSnapshot GetGpuCosts() const override {
+        return scheduler.GpuCosts();
     }
 
     // Enhanced platform-specific initialization

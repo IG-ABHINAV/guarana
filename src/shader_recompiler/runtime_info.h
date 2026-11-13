@@ -97,6 +97,13 @@ struct RuntimeInfo {
 
     bool convert_depth_mode{};
     bool force_early_z{};
+    /// Fragment stage, depth pass of an alpha-test prepass split (EDEN_NX2_PREPASS_HASHES): no
+    /// colour is output, so only what decides a discard is left to compute. With the alpha test
+    /// on, render target 0 keeps the alpha it reads.
+    bool depth_only_discard{};
+    /// Stages before the fragment one, in a pipeline with that split: Position is decorated
+    /// Invariant (EDEN_NX2_PREPASS_INVARIANT).
+    bool invariant_position{};
 
     TessPrimitive tess_primitive{};
     TessSpacing tess_spacing{};
@@ -138,6 +145,13 @@ struct RuntimeInfo {
     u32 mesh_task_offsets_binding{~0U};
     u32 mesh_task_args_binding{~0U};
     u32 mesh_task_payload_stride{}; ///< payload buffer words per task workgroup
+    /// Native mesh program: the culling its epilogue adds (MESH_CULL_* bits) for this pipeline's
+    /// state. With MESH_CULL_SMALL the host pushes viewport 0 at MESH_CULL_VIEWPORT_OFFSET.
+    u32 mesh_cull{};
+    /// Native mesh program: MESH_OUT_* bits for this pipeline, and with MESH_OUT_DEAD what the
+    /// fragment stage loads (nothing without one).
+    u32 mesh_out{};
+    VaryingState mesh_next_stage_loads;
 };
 
 } // namespace Shader

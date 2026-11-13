@@ -134,6 +134,14 @@ add_library(
     string_util.cpp
     string_util.h
     swap.h
+    power_governor.cpp
+    power_governor.h
+    power_meter.cpp
+    power_meter.h
+    power_policy.cpp
+    power_policy.h
+    power_tuning.cpp
+    power_tuning.h
     thread.cpp
     thread.h
     thread_cpu_clock.cpp
@@ -181,7 +189,7 @@ if(WIN32)
         windows/crash_handler.h
         windows/timer_resolution.cpp
         windows/timer_resolution.h)
-    target_link_libraries(common PRIVATE dxgi ntdll)
+    target_link_libraries(common PRIVATE cfgmgr32 dxgi ntdll powrprof)
 endif()
 
 if(NOT WIN32)

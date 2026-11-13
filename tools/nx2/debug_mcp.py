@@ -137,6 +137,47 @@ TOOLS = [
         },
     },
     {
+        "name": "set_shading_rate",
+        "description": "EDEN_NX2_VRS_HASHES at runtime (needs EDEN_NX2_VRS at launch): shades the "
+                       "draws of these fragment shader hashes (frame dump 'shaders') at the given "
+                       "fragment size, from the next draw on; 1x1 restores. all=true sets the rate "
+                       "of every shader not listed. With no hashes, lists the rates. Rates are "
+                       "clamped to what the device supports. auto=<fps> starts the governor "
+                       "(EDEN_NX2_VRS_AUTO) that coarsens the costliest fragment shaders while "
+                       "frames are slower than the target, auto=0 stops it; the reply has its "
+                       "table and deny lists under 'auto'. auto_deny/auto_allow add or remove "
+                       "hashes the governor must leave alone.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "hashes": {"type": "array", "items": {"type": "string"}},
+                "rate": {"type": "string",
+                         "enum": ["1x1", "2x1", "1x2", "2x2", "4x2", "2x4", "4x4"]},
+                "all": {"type": "boolean"},
+                "auto": {"type": "number", "minimum": 0, "maximum": 1000},
+                "auto_deny": {"type": "array", "items": {"type": "string"}},
+                "auto_allow": {"type": "array", "items": {"type": "string"}},
+            },
+        },
+    },
+    {
+        "name": "set_prepass",
+        "description": "EDEN_NX2_PREPASS_HASHES at runtime (experiment): draws of these fragment "
+                       "shader hashes (frame dump 'shaders') are drawn as a depth pass and a "
+                       "colour pass at equal depth, where the shader discards, the draw is opaque "
+                       "and its depth test is a less or greater one; on=false takes the hashes "
+                       "off. Their built pipelines are made again at the next frame end. With no "
+                       "hashes, lists them. The reply counts the pipelines with the split and the "
+                       "draws split and left alone.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "hashes": {"type": "array", "items": {"type": "string"}},
+                "on": {"type": "boolean"},
+            },
+        },
+    },
+    {
         "name": "sample",
         "description": "Sampling profiler: pauses the named host threads about 1000 times a second "
                        "for the given seconds and returns where they were (self, self <- caller, "
@@ -252,6 +293,80 @@ TOOLS = [
                        "on or off; read it with log_tail. Returns the previous and current state.",
         "inputSchema": {"type": "object", "properties": {"stats": {"type": "boolean"}}},
     },
+    {
+        "name": "power",
+        "description": "Host power from the Windows energy meter, averaged over window_ms (0: "
+                       "since the previous call): package_w, cpu_w (cores) and gpu_w (integrated "
+                       "GPU), valid false when nothing was measured; process_cpu_cores (CPU time "
+                       "per wall time of the emulator), gpu_busy_ms of the last sampled frame, "
+                       "the power_set switches, and with EDEN_NX2_POWER_POLICY=igpu the session "
+                       "power scheme change (policy) and the spin governor (governor).",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"window_ms": {"type": "integer", "minimum": 0, "maximum": 10000}},
+        },
+    },
+    {
+        "name": "power_set",
+        "description": "Sets the power switches live and returns them: spin_scale "
+                       "(EDEN_NX2_SPIN_SCALE, scales the GPU threads' busy-wait bounds, 0 blocks "
+                       "at once), eco_background (EDEN_NX2_ECO_BACKGROUND, EcoQoS for background "
+                       "threads that start afterwards) and idle_spin_us (EDEN_NX2_IDLE_SPIN_US, "
+                       "-1 for the default). Without arguments it only reports them.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "spin_scale": {"type": "number", "minimum": 0, "maximum": 1},
+                "eco_background": {"type": "boolean"},
+                "idle_spin_us": {"type": "integer", "minimum": -1, "maximum": 100000},
+            },
+        },
+    },
+    {
+        "name": "gpu_costs",
+        "description": "Host GPU time of the last sampled frame (one a second): per vertex+fragment "
+                       "or compute shader hash ('work') and per render target ('passes'), slowest "
+                       "first. 'enable' turns the sampling on or off; it is off until asked for "
+                       "unless EDEN_NX2_COST_SAMPLING=1 or EDEN_DKB_FRAME_TRACE=1. 'frame' is 0 "
+                       "until a frame was sampled.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "top": {"type": "integer", "minimum": 0, "maximum": 256, "default": 32},
+                "enable": {"type": "boolean"},
+            },
+        },
+    },
+    {
+        "name": "frame_budget",
+        "description": "The frame budget controller (EDEN_NX2_TARGET_FPS): holds guest presents to "
+                       "the target's interval and moves the GPU time scale a Switch 2 title sees "
+                       "(EDEN_NX2_GPU_TIME_SCALE) so its own dynamic resolution fits the frame "
+                       "into it. target_fps sets the target live (0 turns it off), scale sets "
+                       "the scale by hand (the controller goes on from it). Returns the target, "
+                       "frame_ms (median present interval of the last half second), work_ms (the "
+                       "frame without the pacing wait, 80th percentile: what the controller "
+                       "compares), scale and its limits, state (off, frozen, on_target, slow, "
+                       "saturated, fast, cooldown, no_effect, waiting), the scale that last "
+                       "missed and the cool-down left, and whether the shading-rate governor may "
+                       "act.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "target_fps": {"type": "number", "minimum": 0, "maximum": 1000},
+                "scale": {"type": "number", "exclusiveMinimum": 0},
+            },
+        },
+    },
+    {
+        "name": "memory",
+        "description": "Host memory in bytes: the process (working set, commit, peaks), the system "
+                       "(commit against its limit, free RAM), guest memory (resident after the "
+                       "last zero-page trim) and what the renderer's caches hold (device memory "
+                       "against the texture cache thresholds, buffers, staging, mesh arenas, "
+                       "pipelines, kept SPIR-V). Says whether low memory mode is on.",
+        "inputSchema": {"type": "object", "properties": {}},
+    },
 ]
 
 TOOL_NAMES = {tool["name"] for tool in TOOLS}
@@ -319,6 +434,8 @@ def default_timeout(name, params):
         return 120
     if name == "frame_times":
         return math.ceil(params.get("seconds", 5)) + 1
+    if name == "power":
+        return math.ceil(params.get("window_ms", 1000) / 1000) + 5
     if name == "sample":
         return int(params.get("seconds", 10)) + 90
     if name in ("input", "input_sequence"):

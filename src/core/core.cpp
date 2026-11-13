@@ -2,8 +2,11 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <optional>
+#include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstdlib>
+#include <vector>
 #include <atomic>
 #include <memory>
 #include <new>
@@ -17,6 +20,8 @@
 #include "common/logging.h"
 #include "common/memory_detect.h"
 #include "common/nx2_sampler.h"
+#include "common/power_policy.h"
+#include "common/power_tuning.h"
 #include "common/adpf.h"
 #include "common/settings.h"
 #include "common/settings_enums.h"
@@ -30,6 +35,7 @@
 #include "core/cpu_manager.h"
 #include "core/debugger/debugger.h"
 #include "core/debugger/nx2_debug_tools.h"
+#include "core/nx2_power_session.h"
 #include "core/device_memory.h"
 #include "core/file_sys/card_image.h"
 #include "core/file_sys/content_archive.h"
@@ -90,6 +96,39 @@ std::atomic<u64> g_nx2_present_count{};
 static_assert(std::atomic<u64>::is_always_lock_free);
 std::array<std::atomic<u64>, 4096> g_nx2_present_times_ns{};
 std::atomic<u32> g_nx2_present_time_services{};
+
+double Nx2RecentFrameMs() {
+    const u64 capacity = g_nx2_present_times_ns.size();
+    const u64 last = g_nx2_present_count.load(std::memory_order_relaxed);
+    const u64 now = static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                         std::chrono::steady_clock::now().time_since_epoch())
+                                         .count());
+    const u64 window = 1'000'000'000;
+    std::vector<double> intervals;
+    u64 previous = 0;
+    for (u64 frame = last; frame != 0 && last - frame < capacity - 1; --frame) {
+        const u64 timestamp =
+            g_nx2_present_times_ns[frame % capacity].load(std::memory_order_relaxed);
+        if (timestamp > now || now - timestamp > window ||
+            (previous != 0 && timestamp > previous)) {
+            if (frame == last) {
+                // The counter advances before its slot is stored.
+                continue;
+            }
+            break;
+        }
+        if (previous != 0) {
+            intervals.push_back(static_cast<double>(previous - timestamp) / 1'000'000.0);
+        }
+        previous = timestamp;
+    }
+    if (intervals.size() < 3) {
+        return 0.0;
+    }
+    const auto middle = intervals.begin() + intervals.size() / 2;
+    std::ranges::nth_element(intervals, middle);
+    return *middle;
+}
 
 FileSys::VirtualFile GetGameFileFromPath(const FileSys::VirtualFilesystem& vfs,
                                          const std::string& path) {
@@ -206,7 +245,10 @@ std::optional<u64> FindSwitch2Program(const FileSys::VirtualFile& file, u64 prog
 struct System::Impl {
     explicit Impl(System& system)
         : kernel{system}, fs_controller{system}, hid_core{kernel}, cpu_manager{system},
-          reporter{system}, applet_manager{system}, frontend_applets{system}, profile_manager{} {}
+          reporter{system}, applet_manager{system}, frontend_applets{system}, profile_manager{} {
+        // A session that crashed with EDEN_NX2_POWER_POLICY left the power scheme changed.
+        Common::PowerPolicy::RecoverStale();
+    }
 
     u64 program_id;
 
@@ -371,6 +413,7 @@ struct System::Impl {
         debugger.emplace(system, port);
     }
 
+    /// Prepares the device memory and the kernel for the next program.
     SystemResultStatus InitializeKernel(System& system) {
         LOG_DEBUG(Core, "initialized OK");
 
@@ -422,6 +465,7 @@ struct System::Impl {
         return SystemResultStatus::Success;
     }
 
+    /// Creates the program's process and sets up the rest of the system to run it.
     SystemResultStatus Load(System& system, Frontend::EmuWindow& emu_window, const std::string& filepath, Service::AM::FrontendAppletParameters& params) {
         VideoCommon::StutterTrace::BootMarker("boot_start");
         if (params.launch_type == Service::AM::LaunchType::FrontendInitiated) {
@@ -437,6 +481,7 @@ struct System::Impl {
         Kernel::KSystemControl::SetApplicationProgramId(switch2_program_id.value_or(0));
         Settings::SetCurrentProgramIsSwitch2(switch2_program);
         Settings::SetAstcRecompressionOverride(std::nullopt);
+        Settings::ClearPresetValues();
         Network::LocalRedirect::Configure();
 
         if (const auto ram = Common::GetHostRam();
@@ -497,6 +542,7 @@ struct System::Impl {
         auto process = Service::AM::CreateApplicationProcess(control, app_loader, load_result, system, file, params.program_id, params.program_index);
         if (load_result != Loader::ResultStatus::Success) {
             LOG_CRITICAL(Core, "Failed to load ROM (Error {})!", load_result);
+            process.reset();
             ShutdownMainProcess();
             return SystemResultStatus(u32(SystemResultStatus::ErrorLoader) + u32(load_result));
         }
@@ -533,6 +579,9 @@ struct System::Impl {
         SystemResultStatus init_result{SetupForApplicationProcess(system, emu_window)};
         if (init_result != SystemResultStatus::Success) {
             LOG_CRITICAL(Core, "Failed to initialize system (Error {})!", int(init_result));
+            // The process's kernel objects must be closed while the kernel and the device memory
+            // holding them still exist.
+            process.reset();
             ShutdownMainProcess();
             return init_result;
         }
@@ -580,10 +629,15 @@ struct System::Impl {
         }
         debug_service = Nx2Debug::MaybeStartService(system, name, params.program_id);
         Nx2Sampler::StartFromEnvironment();
+        Common::PowerTuning::LogState();
+        power_session = Nx2PowerSession::MaybeStart(system);
         return SystemResultStatus::Success;
     }
 
+    /// Stops the running program and releases what it used, keeping the System reusable for
+    /// the next Load.
     void ShutdownMainProcess() {
+        power_session.reset();
         debug_service.reset();
         SetShuttingDown(true);
         Common::ADPF::Shutdown();
@@ -606,7 +660,13 @@ struct System::Impl {
         core_timing.SyncPause(false);
         Network::CancelPendingSocketOperations();
         kernel.SuspendEmulation(true);
+        if (service_manager) {
+            // Services on host threads that still wait for one on the guest cores give up (after
+            // a close during the boot shader load, the guest cores never started).
+            service_manager->Close();
+        }
         kernel.CloseServices();
+        applet_manager.DropPendingProcess();
         kernel.ShutdownCores();
         // Each step done tells the frontend the teardown still moves (see
         // Common::ShutdownProgress); the GPU's (pipeline caches) reports its own steps.
@@ -623,9 +683,12 @@ struct System::Impl {
         gpu_core.reset();
         Common::NoteShutdownProgress();
         host1x_core.reset();
+        // The renderer reads the preset values until it is gone.
+        Settings::ClearPresetValues();
         perf_stats.reset();
         cpu_manager.Shutdown();
         debugger.reset();
+        ReleaseGeneralChannelEvent();
         kernel.Shutdown();
         stop_event = {};
         Network::RestartSocketOperations();
@@ -734,12 +797,26 @@ struct System::Impl {
     bool nvdec_active : 1 = false;
     /// EDEN_NX2_DEBUG_SERVER; the last member, so it stops before anything it reads goes away.
     std::unique_ptr<Nx2Debug::Service> debug_service;
+    std::unique_ptr<Nx2PowerSession> power_session;
 
+    /// Creates the general channel's event on first use after a kernel (re)start.
     void EnsureGeneralChannelInitialized(System& system) {
         if (!general_channel_event) {
             general_channel_context.emplace(system, "GeneralChannel");
             general_channel_event.emplace(*general_channel_context);
+            // Data pushed before the previous kernel shut down is still queued.
+            if (!general_channel.empty()) {
+                general_channel_event->Signal(kernel);
+            }
         }
+    }
+
+    /// The event is a kernel object: close it before kernel.Shutdown(), which (for a Switch 2
+    /// program, with the device memory) destroys the slab it lives in. The queued data is kept.
+    void ReleaseGeneralChannelEvent() {
+        std::scoped_lock lk{general_channel_mutex};
+        general_channel_event.reset();
+        general_channel_context.reset();
     }
 };
 

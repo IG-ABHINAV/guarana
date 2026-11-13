@@ -9,6 +9,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <mutex>
+#include <vector>
 #include <boost/container/deque.hpp>
 
 #include "common/common_types.h"
@@ -105,6 +106,8 @@ private:
 
     void PresentThread(std::stop_token token);
 
+    void NoteShownFrame();
+
     void CopyToSwapchain(Frame* frame);
 
     void CopyToSwapchainImpl(Frame* frame);
@@ -136,6 +139,9 @@ private:
     vk::SurfaceKHR& surface;
     vk::CommandPool cmdpool;
     std::vector<Frame> frames;
+    std::vector<f32> shown_intervals; ///< EDEN_NX2_SHOWN_STATS, present thread only
+    std::chrono::steady_clock::time_point shown_last{};
+    std::chrono::steady_clock::time_point shown_window{};
     boost::container::deque<Frame*> present_queue;
     boost::container::deque<Frame*> free_queue;
     std::condition_variable_any frame_cv;

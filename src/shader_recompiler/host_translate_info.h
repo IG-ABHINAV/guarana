@@ -45,6 +45,10 @@ struct HostTranslateInfo {
                                         ///< control flow
     bool single_lane_geometry_subgroups{};
     bool support_byte_addressed_r16{};
+    /// Experiment (EDEN_NX2_GM bit 2): the storage buffer pass records, for a native load that
+    /// stays global, the loaded-pointer buffers its address can only come from. Reads nothing new
+    /// from the environment.
+    bool narrow_global_candidates{};
     /// True when a handle read from a table at a per-invocation index may become a descriptor
     /// array of the table's entries (not OpenGL: its pipelines bind at most 64 textures; Vulkan
     /// only with nonuniform sampled image array indexing)

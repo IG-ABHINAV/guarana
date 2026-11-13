@@ -8,6 +8,7 @@
 #include "common/literals.h"
 #include "common/logging.h"
 #include "common/memory_detect.h"
+#include "common/power_tuning.h"
 #include "common/thread.h"
 #include "video_core/shader_jobs.h"
 
@@ -146,9 +147,13 @@ void ShaderJobContext::SetDriverBytes(u64 bytes) {
     job.work.driver_bytes = bytes;
 }
 
+/// Low memory mode's job budget (Common::LowMemoryMode): the least the default ever is.
+constexpr u64 LowMemoryShaderJobBudget = u64{512} << 20;
+
 u64 DefaultShaderJobBudget() {
     using namespace Common::Literals;
-    return std::max<u64>(Common::GetMemInfo().TotalPhysicalMemory / 8, 512_MiB);
+    const u64 budget = std::max<u64>(Common::GetMemInfo().TotalPhysicalMemory / 8, 512_MiB);
+    return Common::LowMemoryMode() ? std::min<u64>(budget, LowMemoryShaderJobBudget) : budget;
 }
 
 ShaderJobScheduler::ShaderJobScheduler(const ShaderJobConfig& config)
@@ -160,6 +165,7 @@ ShaderJobScheduler::ShaderJobScheduler(const ShaderJobConfig& config)
             Common::SetCurrentThreadName(name.c_str());
             Common::SetCurrentThreadPriority(Common::ThreadPriority::Low);
             Common::SetCurrentThreadToBackgroundWork();
+            Common::PowerTuning::TagBackgroundThread();
             Worker(driver);
         });
     }};

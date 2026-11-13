@@ -3,10 +3,15 @@
 
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
+#include <cmath>
+#include <cstdlib>
 #include <thread>
+#include <vector>
 
 #include "common/display_hdr.h"
 #include "common/dkb_frame_trace.h"
+#include "common/logging.h"
 #include "common/scope_exit.h"
 #include "common/settings.h"
 #include "common/thread.h"
@@ -286,6 +291,42 @@ void PresentManager::Present(Frame* frame) {
     }
 }
 
+void PresentManager::NoteShownFrame() {
+    // EDEN_NX2_SHOWN_STATS=1: every 10 s, how evenly frames reached the swapchain (generated ones
+    // included): the intervals between presents and the share within 2 ms of the median.
+    static const bool enabled = std::getenv("EDEN_NX2_SHOWN_STATS") != nullptr;
+    if (!enabled) {
+        return;
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (shown_last != std::chrono::steady_clock::time_point{}) {
+        shown_intervals.push_back(std::chrono::duration<f32, std::milli>(now - shown_last).count());
+    }
+    shown_last = now;
+    if (shown_window == std::chrono::steady_clock::time_point{}) {
+        shown_window = now;
+    }
+    if (now - shown_window < std::chrono::seconds{10} || shown_intervals.size() < 8) {
+        return;
+    }
+    auto sorted = shown_intervals;
+    std::sort(sorted.begin(), sorted.end());
+    const auto at = [&sorted](size_t percent) { return sorted[(sorted.size() - 1) * percent / 100]; };
+    const f32 median = at(50);
+    const auto even = std::count_if(sorted.begin(), sorted.end(), [median](f32 interval) {
+        return std::abs(interval - median) <= 2.0f;
+    });
+    LOG_INFO(Render_Vulkan,
+             "Shown frames: {:.1f} per second, interval p5 {:.1f} p50 {:.1f} p95 {:.1f} p99 {:.1f} "
+             "max {:.1f} ms, {:.0f}% within 2 ms of the median",
+             static_cast<f64>(sorted.size()) /
+                 std::chrono::duration<f64>(now - shown_window).count(),
+             at(5), median, at(95), at(99), sorted.back(),
+             100.0 * static_cast<f64>(even) / static_cast<f64>(sorted.size()));
+    shown_intervals.clear();
+    shown_window = now;
+}
+
 size_t PresentManager::MaxExtraFrames() const {
     return image_count - 1;
 }
@@ -453,6 +494,7 @@ void PresentManager::PresentThread(std::stop_token token) {
             if (trace) {
                 LogPacing(frame, presented - ready, presented);
             }
+            NoteShownFrame();
 
             // Free the frame for reuse
             std::scoped_lock fl{free_mutex};

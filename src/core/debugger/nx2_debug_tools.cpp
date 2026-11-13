@@ -17,9 +17,14 @@
 #include <thread>
 
 #include "common/fs/path_util.h"
+#include "common/host_memory.h"
+#include "common/memory_detect.h"
 #include "common/scope_exit.h"
 #include "common/logging.h"
 #include "common/nx2_sampler.h"
+#include "common/power_meter.h"
+#include "common/power_policy.h"
+#include "common/power_tuning.h"
 #include "common/scm_rev.h"
 #include "common/settings.h"
 #include "common/stb.h"
@@ -28,9 +33,13 @@
 #include "core/debugger/nx2_debug_server.h"
 #include "core/debugger/nx2_debug_tools.h"
 #include "core/frontend/framebuffer_layout.h"
+#include "core/hle/kernel/board/nintendo/nx/k_system_control.h"
 #include "core/hle/kernel/k_process.h"
 #include "core/memory.h"
+#include "core/nx2_power_session.h"
 #include "hid_core/hid_core.h"
+#include "video_core/auto_shading_rate.h"
+#include "video_core/frame_budget.h"
 #include "video_core/gpu.h"
 #include "video_core/nx2_debug_control.h"
 #include "video_core/renderer_base.h"
@@ -79,6 +88,9 @@ struct ToolState {
     u64 screenshots{};
     u64 samples{};
     u64 gpu_reads{};
+    /// Process CPU time and when it was read, at the previous power call.
+    double power_cpu_seconds{};
+    std::chrono::steady_clock::time_point power_time{};
     std::atomic<bool> stopping{};
 };
 
@@ -476,6 +488,113 @@ json RejectShaders(ToolState&, const json& params) {
     return result;
 }
 
+json SetShadingRate(ToolState& state, const json& params) {
+    if (!IsVulkan()) {
+        throw std::runtime_error{"shading rates need the Vulkan renderer"};
+    }
+    namespace Auto = VideoCore::AutoShadingRate;
+    const bool enabled = std::getenv("EDEN_NX2_VRS") != nullptr;
+    auto& renderer = state.system.GPU().Renderer();
+    if (params.contains("auto")) {
+        const double fps = params.at("auto").get<double>();
+        if (fps > 0.0 && !enabled) {
+            throw std::runtime_error{"the governor needs EDEN_NX2_VRS at launch"};
+        }
+        if (fps > 0.0 && !renderer.RequestGpuCostSampling(true)) {
+            throw std::runtime_error{"the governor needs cost sampling, which is unavailable"};
+        }
+        Auto::SetTargetFps(fps > 0.0 ? fps : 0.0);
+    }
+    for (const char* const key : {"auto_deny", "auto_allow"}) {
+        std::vector<u64> listed;
+        for (const json& hash : params.value(key, json::array())) {
+            listed.push_back(ParseShaderHash(hash.get<std::string>()));
+        }
+        Auto::SetDenied(listed, std::string_view{key} == "auto_deny");
+    }
+    std::vector<u64> hashes;
+    for (const json& hash : params.value("hashes", json::array())) {
+        hashes.push_back(ParseShaderHash(hash.get<std::string>()));
+    }
+    const bool all = params.value("all", false);
+    if (!hashes.empty() || all) {
+        const std::string text = params.value("rate", std::string{"2x2"});
+        const auto rate = VideoCore::Nx2Debug::ParseShadingRate(text);
+        if (!rate) {
+            throw std::runtime_error{fmt::format(
+                "bad rate \"{}\": want 1x1, 2x1, 1x2, 2x2, 4x2, 2x4 or 4x4", text)};
+        }
+        VideoCore::Nx2Debug::SetShadingRates(hashes, *rate, all);
+    }
+    const auto size = [](VideoCore::Nx2Debug::ShadingRate rate) {
+        return fmt::format("{}x{}", rate.width, rate.height);
+    };
+    const VideoCore::Nx2Debug::ShadingRateTable table = VideoCore::Nx2Debug::ShadingRates();
+    json rates = json::object();
+    for (const auto& [hash, rate] : table.rates) {
+        rates[Hex(hash)] = size(rate);
+    }
+    json result = {{"enabled", enabled}, {"default", size(table.fallback)}, {"rates", std::move(rates)}};
+    if (!enabled) {
+        result["note"] = "EDEN_NX2_VRS is not set: the rates are kept but no draw uses them";
+    }
+    // The governor layer: used where the manual table above says nothing.
+    const Auto::Status status = Auto::GetStatus();
+    json auto_rates = json::object();
+    for (const auto& [hash, rate] : table.auto_rates) {
+        auto_rates[Hex(hash)] = size(rate);
+    }
+    json levels = json::object();
+    for (const auto& [hash, level] : status.levels) {
+        levels[Hex(hash)] = level;
+    }
+    const auto capped = [](std::vector<u64> hashes) {
+        hashes.resize((std::min)(hashes.size(), size_t{64}));
+        return HexList(hashes);
+    };
+    result["auto"] = {
+        {"target_fps", status.target_fps},
+        {"target_ms", status.target_ms},
+        {"frame_ms", status.frame_ms},
+        {"allowed", status.allowed},
+        {"sampling", renderer.IsGpuCostSampling()},
+        {"snapshots", status.snapshots},
+        {"max_level", status.max_level},
+        {"rates", std::move(auto_rates)},
+        {"levels", std::move(levels)},
+        {"denied",
+         {{"user", HexList(status.denied_user)},
+          {"small_draws_count", status.denied_small.size()},
+          {"small_draws", capped(status.denied_small)},
+          {"side_targets_count", status.denied_side.size()},
+          {"side_targets", capped(status.denied_side)},
+          {"depth_writers", status.depth_writers}}},
+        {"last_action", status.last_action},
+        {"hold_reason", status.hold_reason},
+    };
+    return result;
+}
+
+json SetPrepass(ToolState&, const json& params) {
+    if (!IsVulkan()) {
+        throw std::runtime_error{"the prepass split needs the Vulkan renderer"};
+    }
+    std::vector<u64> hashes;
+    for (const json& hash : params.value("hashes", json::array())) {
+        hashes.push_back(ParseShaderHash(hash.get<std::string>()));
+    }
+    if (!hashes.empty()) {
+        VideoCore::Nx2Debug::SetPrepassHashes(hashes, params.value("on", true));
+    }
+    const VideoCore::Nx2Debug::PrepassCounts counts = VideoCore::Nx2Debug::PrepassCountsSoFar();
+    return {
+        {"hashes", HexList(VideoCore::Nx2Debug::PrepassHashes().hashes)},
+        {"pipelines", counts.pipelines},
+        {"split_draws", counts.split_draws},
+        {"plain_draws", counts.plain_draws},
+    };
+}
+
 json SampleThreads(ToolState& state, const json& params) {
     const std::string threads = params.value("threads", std::string{"GPU,GPUBack"});
     const double seconds = Param<double>(params, "seconds", 10.0, 1.0, 60.0);
@@ -504,6 +623,275 @@ json HostTiming(ToolState& state, const json& params) {
         stats = params.at("stats").get<bool>();
     }
     return {{"previous", previous}, {"stats", stats.load()}};
+}
+
+json PowerSwitches() {
+    namespace Tuning = Common::PowerTuning;
+    return {
+        {"spin_scale", Tuning::spin_percent.load(std::memory_order_relaxed) / 100.0},
+        {"eco_background", Tuning::eco_background.load(std::memory_order_relaxed)},
+        {"idle_spin_us", Tuning::idle_spin_us.load(std::memory_order_relaxed)},
+    };
+}
+
+// Host package, CPU core and integrated GPU watts and the cores this process kept busy, averaged
+// over window_ms (0: since the previous call).
+json Power(ToolState& state, const json& params) {
+    const auto window = std::chrono::milliseconds{Param<int>(params, "window_ms", 1000, 0, 10000)};
+    auto& meter = Common::PowerMeter::Instance();
+    VideoCore::RendererBase* const renderer =
+        state.system.IsPoweredOn() ? &state.system.GPU().Renderer() : nullptr;
+    if (renderer != nullptr) {
+        renderer->RequestGpuBusySample();
+    }
+    if (window.count() > 0) {
+        static_cast<void>(meter.Read());
+        state.power_cpu_seconds = Common::ProcessCpuSeconds();
+        state.power_time = std::chrono::steady_clock::now();
+        while (std::chrono::steady_clock::now() - state.power_time < window &&
+               !state.stopping.load(std::memory_order_relaxed)) {
+            std::this_thread::sleep_for(20ms);
+        }
+    }
+    const Common::PowerMeter::Sample sample = meter.Read();
+    const double cpu_seconds = Common::ProcessCpuSeconds();
+    const auto now = std::chrono::steady_clock::now();
+    const bool first = state.power_time == std::chrono::steady_clock::time_point{};
+    const double seconds = std::chrono::duration<double>(now - state.power_time).count();
+    const double cores =
+        !first && seconds > 0.0 ? (cpu_seconds - state.power_cpu_seconds) / seconds : 0.0;
+    state.power_cpu_seconds = cpu_seconds;
+    state.power_time = now;
+    json result = {
+        {"available", meter.Available()},
+        {"valid", sample.valid},
+        {"package_w", sample.package_w},
+        {"cpu_w", sample.cpu_w},
+        {"gpu_w", sample.gpu_w},
+        {"seconds", first ? 0.0 : seconds},
+        {"process_cpu_cores", cores},
+        {"gpu_busy_ms", nullptr},
+        {"channels", meter.ChannelNames()},
+    };
+    if (renderer != nullptr) {
+        if (const auto busy = renderer->GetGpuBusyMs()) {
+            result["gpu_busy_ms"] = *busy;
+        }
+    }
+    result.update(PowerSwitches());
+    // EDEN_NX2_POWER_POLICY=igpu: the power scheme change of the session and the spin governor.
+    const Common::PowerPolicy::Status policy = Common::PowerPolicy::GetStatus();
+    json settings = json::object();
+    for (const auto& setting : policy.settings) {
+        settings[setting.name] = {{"saved_ac", setting.saved_ac},
+                                  {"saved_dc", setting.saved_dc},
+                                  {"applied_ac", setting.applied_ac},
+                                  {"applied_dc", setting.applied_dc}};
+    }
+    result["policy"] = {{"requested", policy.requested},
+                        {"active", policy.active},
+                        {"scheme", policy.scheme},
+                        {"settings", std::move(settings)},
+                        {"message", policy.message}};
+    const Core::Nx2PowerSession::GovernorState governor = Core::Nx2PowerSession::LastState();
+    result["governor"] = {{"running", governor.running},
+                          {"state", governor.state},
+                          {"spin_scale", governor.spin_percent / 100.0},
+                          {"ceiling", governor.ceiling / 100.0},
+                          {"target_fps", governor.target_fps},
+                          {"frame_ms", governor.frame_ms},
+                          {"gpu_busy", governor.gpu_busy},
+                          {"package_w", governor.package_w},
+                          {"cpu_w", governor.cpu_w},
+                          {"gpu_w", governor.gpu_w},
+                          {"changes", governor.changes},
+                          {"last_change", governor.last_change}};
+    return result;
+}
+
+// Changes the power switches live. eco_background only reaches threads that start afterwards.
+json PowerSet(ToolState&, const json& params) {
+    namespace Tuning = Common::PowerTuning;
+    if (params.contains("spin_scale")) {
+        Tuning::spin_percent.store(Tuning::SpinPercent(params.at("spin_scale").get<double>()),
+                                   std::memory_order_relaxed);
+    }
+    if (params.contains("eco_background")) {
+        Tuning::eco_background.store(params.at("eco_background").get<bool>(),
+                                     std::memory_order_relaxed);
+    }
+    if (params.contains("idle_spin_us")) {
+        Tuning::idle_spin_us.store((std::clamp)(params.at("idle_spin_us").get<s64>(), s64{-1},
+                                                s64{100000}),
+                                   std::memory_order_relaxed);
+    }
+    return PowerSwitches();
+}
+
+// Host GPU time of the last sampled frame by shaders and by render target.
+json GpuCosts(ToolState& state, const json& params) {
+    auto& renderer = state.system.GPU().Renderer();
+    const bool previous = renderer.IsGpuCostSampling();
+    if (params.contains("enable")) {
+        const bool enable = params.at("enable").get<bool>();
+        if (!renderer.RequestGpuCostSampling(enable) && enable) {
+            throw std::runtime_error{"cost sampling is unavailable: it needs the Vulkan renderer "
+                                     "with timestamp queries"};
+        }
+    }
+    const u32 top = Param<u32>(params, "top", 32, 0, 256);
+    const VideoCore::GpuCostSnapshot costs = renderer.GetGpuCosts();
+    json work = json::array();
+    for (size_t i = 0; i < costs.work.size() && i < top; ++i) {
+        const auto& entry = costs.work[i];
+        json item = {
+            {"vertex_hash", Hex(entry.vertex_hash)},
+            {"fragment_hash", Hex(entry.fragment_hash)},
+            {"kind", entry.kind == '\0' ? std::string{} : std::string(1, entry.kind)},
+            {"compute", entry.IsCompute()},
+            {"draws", entry.draws},
+            {"small_draws", entry.small_draws},
+            {"side_draws", entry.side_draws},
+            {"total_ms", entry.total_ms},
+            {"max_ms", entry.max_ms},
+        };
+        work.push_back(std::move(item));
+    }
+    json passes = json::array();
+    for (size_t i = 0; i < costs.passes.size() && i < top; ++i) {
+        const auto& pass = costs.passes[i];
+        json item = {
+            {"width", pass.width},
+            {"height", pass.height},
+            {"color_format", pass.color_format},
+            {"num_colors", pass.num_colors},
+            {"depth_format", pass.depth_format},
+            {"samples", pass.samples},
+            {"passes", pass.passes},
+            {"total_ms", pass.total_ms},
+            {"max_ms", pass.max_ms},
+        };
+        passes.push_back(std::move(item));
+    }
+    json emu = json::array();
+    for (const auto& entry : costs.emu) {
+        emu.push_back({{"category", entry.category},
+                       {"count", entry.count},
+                       {"total_ms", entry.total_ms},
+                       {"max_ms", entry.max_ms}});
+    }
+    json age = nullptr;
+    if (costs.frame != 0) {
+        age = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() -
+                                                        costs.when)
+                  .count();
+    }
+    return {{"previous", previous},
+            {"sampling", renderer.IsGpuCostSampling()},
+            {"frame", costs.frame},
+            {"age_ms", std::move(age)},
+            {"frame_span_ms", costs.frame_span_ms},
+            {"has_main_target", costs.has_main_target},
+            {"submission_sum_ms", costs.submission_sum_ms},
+            {"timed_sum_ms", costs.timed_sum_ms},
+            {"emu_sum_ms", costs.emu_sum_ms},
+            {"emu", std::move(emu)},
+            {"work_entries", costs.work.size()},
+            {"work", std::move(work)},
+            {"pass_entries", costs.passes.size()},
+            {"passes", std::move(passes)}};
+}
+
+// The frame budget controller (EDEN_NX2_TARGET_FPS): sets the target and the GPU time scale live
+// and reports what the controller measured and decided at its last tick.
+json FrameBudgetTool(ToolState&, const json& params) {
+    namespace Budget = VideoCore::FrameBudget;
+    if (params.contains("target_fps")) {
+        const double fps = params.at("target_fps").get<double>();
+        if (!std::isfinite(fps) || (fps != 0.0 && (fps < 1.0 || fps > 1000.0))) {
+            throw std::runtime_error{"target_fps: want 0 (off) or 1 to 1000"};
+        }
+        Budget::SetTargetFps(fps);
+    }
+    if (params.contains("scale")) {
+        const double scale = params.at("scale").get<double>();
+        if (!std::isfinite(scale) || scale <= 0.0) {
+            throw std::runtime_error{"scale: want a positive number"};
+        }
+        Budget::SetGpuTimeScale(scale);
+    }
+    const Budget::Status status = Budget::GetStatus();
+    return {{"target_fps", status.target_fps},
+            {"target_ms", status.target_ms},
+            {"frame_ms", status.frame_ms},
+            {"work_ms", status.work_ms},
+            {"samples", status.samples},
+            {"scale", status.scale},
+            {"latched_scale", status.latched_scale},
+            {"manual_scale", status.manual_scale},
+            {"min_scale", status.min_scale},
+            {"max_scale", status.max_scale},
+            {"state", status.state},
+            {"ticks", status.ticks},
+            {"raises", status.raises},
+            {"lowers", status.lowers},
+            {"miss_scale", status.miss_scale},
+            {"cooldown_ticks", status.cooldown_ticks},
+            {"fast_streak", status.fast_streak},
+            {"blind_lowers", status.blind_lowers},
+            {"shading_rate_allowed", status.shading_allowed},
+            {"last_change", status.last_change}};
+}
+
+/// Host memory of the process and the system, and what the caches last published
+/// (Common::g_memory_counters). All sizes in bytes.
+json MemoryReport(ToolState&, const json&) {
+    const Common::ProcessMemoryUsage usage = Common::GetProcessMemoryUsage();
+    const Common::MemoryCounters& counters = Common::g_memory_counters;
+    const auto get = [](const std::atomic<u64>& value) {
+        return value.load(std::memory_order_relaxed);
+    };
+    return {
+        {"low_memory_mode", Common::LowMemoryMode()},
+        {"low_memory_reason", std::string{Common::LowMemoryModeReason()}},
+        {"process",
+         {
+             {"working_set", usage.working_set},
+             {"private_working_set", usage.private_working_set},
+             {"peak_working_set", usage.peak_working_set},
+             {"commit", usage.commit},
+             {"peak_commit", usage.peak_commit},
+         }},
+        {"system",
+         {
+             {"commit", usage.system_commit},
+             {"commit_limit", usage.system_commit_limit},
+             {"physical_total", usage.physical_total},
+             {"physical_available", usage.physical_available},
+         }},
+        {"guest",
+         {
+             {"size", u64{Kernel::Board::Nintendo::Nx::KSystemControl::Init::GetIntendedMemorySize()}},
+             {"resident_after_trim", get(counters.guest_resident)},
+             {"zero_trimmed_total", get(counters.guest_zero_trimmed)},
+             {"zero_filled_total", Common::HostMemory::ZeroFilledBytes()},
+             {"lazy_commit", get(counters.guest_lazy_commit)},
+         }},
+        {"renderer",
+         {
+             {"device_usage", get(counters.device_usage)},
+             {"texture_expected", get(counters.texture_expected)},
+             {"texture_critical", get(counters.texture_critical)},
+             {"buffer_cache", get(counters.buffer_cache_bytes)},
+             {"staging", get(counters.staging_bytes)},
+             {"mesh_arenas", get(counters.mesh_arena_bytes)},
+             {"graphics_pipelines", get(counters.graphics_pipelines)},
+             {"built_pipelines", get(counters.built_pipelines)},
+             {"kept_pipelines_limit", get(counters.kept_pipelines_limit)},
+             {"kept_spirv_entries", get(counters.kept_spirv_entries)},
+             {"kept_spirv", get(counters.kept_spirv_bytes)},
+         }},
+    };
 }
 
 json ReadMemory(ToolState& state, const json& params) {
@@ -699,9 +1087,16 @@ Handlers MakeHandlers(const std::shared_ptr<ToolState>& state) {
         {"log_filter", handler(LogFilter)},
         {"capture_frame", handler(CaptureFrame)},
         {"reject_shaders", handler(RejectShaders)},
+        {"set_shading_rate", handler(SetShadingRate)},
+        {"set_prepass", handler(SetPrepass)},
         {"sample", handler(SampleThreads)},
         {"speed_limit", handler(SpeedLimit)},
         {"host_timing", handler(HostTiming)},
+        {"power", handler(Power)},
+        {"power_set", handler(PowerSet)},
+        {"gpu_costs", handler(GpuCosts)},
+        {"frame_budget", handler(FrameBudgetTool)},
+        {"memory", handler(MemoryReport)},
         {"read_memory", handler(ReadMemory)},
         {"search_memory", handler(SearchMemory)},
         {"read_gpu_memory", handler(ReadGpuMemory)},

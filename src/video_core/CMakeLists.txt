@@ -34,6 +34,10 @@ add_library(video_core STATIC
     control/channel_state_cache.h
     control/scheduler.cpp
     control/scheduler.h
+    auto_shading_rate.cpp
+    auto_shading_rate.h
+    cost_governor.cpp
+    cost_governor.h
     delayed_destruction_ring.h
     dirty_flags.cpp
     dirty_flags.h
@@ -60,6 +64,10 @@ add_library(video_core STATIC
     engines/maxwell_dma.h
     engines/puller.cpp
     engines/puller.h
+    frame_budget.cpp
+    frame_budget.h
+    frame_budget_controller.cpp
+    frame_budget_controller.h
     framebuffer_config.cpp
     framebuffer_config.h
     render_trace.h
@@ -103,6 +111,7 @@ add_library(video_core STATIC
     frame_gen_choice.h
     gpu.cpp
     gpu.h
+    gpu_costs.h
     gpu_timestamp.h
     gpu_split.cpp
     gpu_split.h
@@ -133,9 +142,11 @@ add_library(video_core STATIC
     nx2_stutter_trace.cpp
     nx2_stutter_trace.h
     nx2_perf.h
+    nx2_uma.h
     nx2_async_readback.h
     nx2_download_trace.h
     pending_maps.h
+    pipeline_cache_policy.h
     present.h
     pte_kind.h
     query_cache/bank_base.h
@@ -217,6 +228,7 @@ add_library(video_core STATIC
     vulkan_common/ffx_runtime.h
     renderer_vulkan/vk_dlss_network_probe.cpp
     renderer_vulkan/vk_dlss_network_probe.h
+    renderer_vulkan/present/extrapolation_source.h
     renderer_vulkan/vk_ocarina_camera_motion.cpp
     renderer_vulkan/vk_ocarina_camera_motion.h
     renderer_vulkan/vk_compute_pipeline.cpp
@@ -387,6 +399,8 @@ if (ENABLE_LSFG)
         frame_gen/lossless_dll.h
         frame_gen/lsfg_translate.cpp
         frame_gen/lsfg_translate.h
+        renderer_vulkan/present/frame_extrapolation.cpp
+        renderer_vulkan/present/frame_extrapolation.h
         renderer_vulkan/present/frame_gen.cpp
         renderer_vulkan/present/frame_gen.h
         renderer_vulkan/present/fsr3_frame_gen.cpp

@@ -12,6 +12,7 @@
 #include <utility>
 
 #include "common/assert.h"
+#include "common/logging.h"
 #include "common/scope_exit.h"
 #include "common/settings.h"
 #include "common/settings_enums.h"
@@ -32,6 +33,7 @@
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/nx2_fast_draw.h"
 #include "video_core/engines/maxwell_dma.h"
+#include "video_core/frame_budget.h"
 #include "video_core/gpu.h"
 #include "video_core/pending_maps.h"
 #include "video_core/gpu_thread.h"
@@ -204,9 +206,12 @@ struct GPU::Impl {
     }
 
     void RendererFrameEndNotify() {
+        // The GPU time scale (EDEN_NX2_GPU_TIME_SCALE, or the frame budget controller's) is
+        // latched with the present like the clock: within a frame it never changes.
         ampere_anchor.store(
             AmpereAnchor::At(static_cast<u64>(system.CoreTiming().GetGlobalTimeNs().count()),
-                             Settings::values.gpu_clock.GetValue()),
+                             Settings::values.gpu_clock.GetValue(),
+                             VideoCore::FrameBudget::GpuTimeScale()),
             std::memory_order_relaxed);
         system.GetPerfStats().EndGameFrame();
     }

@@ -125,6 +125,12 @@ public:
     /// EDEN_NX2_MEM_TRACE: staging buffers, then the process, DXGI and VMA (LogMemoryTrace).
     void LogMemoryTrace();
 
+    /// Whether the GPU's memory is the host's RAM.
+    bool IsIntegratedGpu() const;
+
+    /// Bytes of the cached staging buffers of every kind.
+    u64 StagingBytes();
+
     /// True when ASTC is re-compressed to BC3 and opaque images may use BC1 instead.
     bool UseOpaqueAstcFormat() const;
 
@@ -196,6 +202,8 @@ public:
 
     void TransitionImageLayout(Image& image);
 
+    bool ClearImage(Image& image);
+
     bool HasBrokenTextureViewFormats() const noexcept {
         // No known Vulkan driver has broken image views
         return false;
@@ -264,6 +272,10 @@ public:
     std::optional<f32> ocarina_fsr_lod_bias;
     /// Set when the Ocarina upscaler fails during the session: samplers drop the bias again.
     bool ocarina_fsr_failed{};
+    /// EDEN_NX2_OOT_FSR_ANY: the bias of the scale FSR last upscaled at, in quarter LODs below
+    /// zero (VideoCommon::OcarinaFsrLodBiasQuarters), in place of the session's bias and in
+    /// either console mode. 0 until FSR replaces a frame.
+    u8 ocarina_fsr_lod_quarters{};
     /// The game DLSS network's health check (ProbeGameDlssOutput), created on first use.
     std::unique_ptr<DlssNetworkProbe> dlss_network_probe;
     std::optional<std::chrono::steady_clock::time_point> fsr3_last_evaluation;
@@ -387,9 +399,31 @@ public:
         return render_pass_key;
     }
 
+    /// `depth_layout` is RenderPassKey::depth_layout.
     [[nodiscard]] VkRenderPass RenderPassVariant(u32 color_clear_mask, bool depth_stencil_clear,
                                                  u32 color_discard_mask,
-                                                 bool depth_stencil_discard) const;
+                                                 bool depth_stencil_discard,
+                                                 u8 depth_layout = 0) const;
+
+    /// The depth-stencil attachment's image, null without one.
+    [[nodiscard]] VkImage DepthImage() const noexcept {
+        return has_depth || has_stencil ? images[num_images - 1] : VkImage{};
+    }
+
+    /// The depth-stencil attachment's range; only with a DepthImage.
+    [[nodiscard]] const VkImageSubresourceRange& DepthImageRange() const noexcept {
+        return image_ranges[num_images - 1];
+    }
+
+    /// EDEN_NX2_DEPTH_OPTIMAL: a draw sampled this framebuffer's own depth attachment, so its
+    /// passes keep that attachment in GENERAL from now on.
+    void NoteDepthSampledInPass() noexcept {
+        depth_sampled_in_pass = true;
+    }
+
+    [[nodiscard]] bool DepthSampledInPass() const noexcept {
+        return depth_sampled_in_pass;
+    }
 
     [[nodiscard]] VkExtent2D RenderArea() const noexcept {
         return render_area;
@@ -463,6 +497,7 @@ private:
     bool has_depth{};
     bool has_stencil{};
     bool is_rescaled{};
+    bool depth_sampled_in_pass{};
     std::array<VkImage, 9> resolve_shadow_images{};
     u32 num_resolve_shadows = 0;
     TextureCacheRuntime* runtime_ptr{nullptr};
@@ -843,6 +878,12 @@ public:
 
     [[nodiscard]] VkSampler HandleFor(const ImageView& image_view, bool is_depth);
 
+    /// HandleFor can pick another variant for the same view later: the Ocarina FSR LOD bias
+    /// follows the image's GPU writes and the console mode.
+    [[nodiscard]] bool HasChangingVariants() const noexcept {
+        return added_lod_bias != 0.0f;
+    }
+
     /// The guest descriptor and the host state built from it, for EDEN_NX2_FRAME_DUMP_SAMPLED.
     [[nodiscard]] const Tegra::Texture::TSCEntry& Descriptor() const noexcept {
         return descriptor;
@@ -861,6 +902,8 @@ private:
         bool srgb_border;
         bool drop_compare;
         bool drop_lod_bias; ///< the image was written by the GPU: no Ocarina FSR LOD bias
+        /// TextureCacheRuntime::ocarina_fsr_lod_quarters in place of the session's bias, when set
+        u8 lod_bias_quarters;
         std::array<VkComponentSwizzle, 4> swizzle;
 
         bool operator==(const VariantKey&) const noexcept = default;
@@ -886,6 +929,7 @@ private:
 
     const Device* device_ptr{nullptr};
     const bool* ocarina_fsr_failed{}; ///< TextureCacheRuntime::ocarina_fsr_failed
+    const u8* ocarina_fsr_lod_quarters{}; ///< TextureCacheRuntime::ocarina_fsr_lod_quarters
     Tegra::Texture::TSCEntry descriptor{};
     VkSamplerCreateInfo base_ci{};
     VkSamplerReductionModeEXT reduction_mode{VK_SAMPLER_REDUCTION_MODE_WEIGHTED_AVERAGE_EXT};

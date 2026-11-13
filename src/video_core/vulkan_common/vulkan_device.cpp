@@ -479,6 +479,17 @@ void Device::RemoveExtensionFeature(bool& extension, Feature& feature,
     feature.pNext = pNext;
 }
 
+VkExtent2D Device::ClampFragmentShadingRate(VkExtent2D wanted) const {
+    VkExtent2D best{1, 1};
+    for (const VkExtent2D rate : fragment_shading_rates) {
+        if (rate.width <= wanted.width && rate.height <= wanted.height &&
+            rate.width * rate.height > best.width * best.height) {
+            best = rate;
+        }
+    }
+    return best;
+}
+
 template <typename Feature>
 void Device::RemoveExtensionFeatureIfUnsuitable(bool is_suitable, Feature& feature,
                                                 const std::string& extension_name) {
@@ -513,7 +524,8 @@ bool WantsFsr4Port(VkDriverId driver_id) {
 } // Anonymous namespace
 
 Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR surface,
-               const vk::InstanceDispatch& dld_)
+               const vk::InstanceDispatch& dld_,
+               const std::function<void(const Device&)>& on_capabilities)
     : instance{instance_}, dld{dld_}, physical{physical_},
     format_properties(GetFormatProperties(physical)) {
     // Get suitability and device properties.
@@ -595,6 +607,9 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
 
     supports_conditional_barriers = !is_intel_windows;
 
+    if (on_capabilities) {
+        on_capabilities(*this);
+    }
     CollectPhysicalMemoryInfo();
     CollectToolingInfo();
 
@@ -1628,6 +1643,11 @@ bool Device::GetSuitability(bool requires_swapchain) {
             VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_PROPERTIES_KHR;
         SetNext(next, properties.cooperative_matrix);
     }
+    if (extensions.fragment_shading_rate) {
+        properties.fragment_shading_rate.sType =
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADING_RATE_PROPERTIES_KHR;
+        SetNext(next, properties.fragment_shading_rate);
+    }
     if (supported_extensions.contains(VK_KHR_SHADER_INTEGER_DOT_PRODUCT_EXTENSION_NAME)) {
         properties.integer_dot_product.sType =
             VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_INTEGER_DOT_PRODUCT_PROPERTIES;
@@ -1689,7 +1709,21 @@ bool Device::GetSuitability(bool requires_swapchain) {
     // Disable VertexInputDynamicState on old Intel Windows drivers
     if (extensions.vertex_input_dynamic_state) {
         const u32 version = (properties.properties.driverVersion << 3) >> 3;
-        if ((driver_id == VK_DRIVER_ID_INTEL_PROPRIETARY_WINDOWS && version < VK_MAKE_API_VERSION(27, 20, 100, 0))
+        // EDEN_NX2_INTEL_VIDS=1: Intel Windows packs driverVersion as (major << 14) | minor
+        // (101.9175 is 1663959), below the 0x65064000 it is compared with on every driver, so
+        // all of them lose the extension. With the switch only drivers before 101.x do.
+        static const bool intel_vids = [] {
+            const char* value = std::getenv("EDEN_NX2_INTEL_VIDS");
+            return value && std::string_view{value} == "1";
+        }();
+        const bool intel_broken = intel_vids
+                                      ? (properties.properties.driverVersion >> 14) < 101
+                                      : version < VK_MAKE_API_VERSION(27, 20, 100, 0);
+        if (intel_vids && driver_id == VK_DRIVER_ID_INTEL_PROPRIETARY_WINDOWS && !intel_broken) {
+            LOG_INFO(Render_Vulkan,
+                     "EDEN_NX2_INTEL_VIDS: keeping VK_EXT_vertex_input_dynamic_state");
+        }
+        if ((driver_id == VK_DRIVER_ID_INTEL_PROPRIETARY_WINDOWS && intel_broken)
         || (driver_id == VK_DRIVER_ID_NVIDIA_PROPRIETARY && properties.properties.driverVersion < NvidiaDriverVersion(580, 119, 2))) {
             LOG_WARNING(Render_Vulkan, "Disabling broken VK_EXT_vertex_input_dynamic_state");
             RemoveExtensionFeature(extensions.vertex_input_dynamic_state, features.vertex_input_dynamic_state, VK_EXT_VERTEX_INPUT_DYNAMIC_STATE_EXTENSION_NAME);
@@ -1848,6 +1882,23 @@ void Device::RemoveUnsuitableExtensions() {
     RemoveExtensionFeatureIfUnsuitable(extensions.shader_atomic_int64, features.shader_atomic_int64,
                                        VK_KHR_SHADER_ATOMIC_INT64_EXTENSION_NAME);
 
+    // VK_EXT_shader_atomic_float: storage buffer float32 atomic add in hardware instead of a
+    // compare-exchange loop. Intel only for now (the GPU it was measured on): on an Arc B580 a
+    // contended loop of Ocarina of Time (1e1964184a291f00, 96 groups) took 2 ms of each frame.
+    // EDEN_NX2_NO_FLOAT_ATOMICS=1 keeps the loop.
+    {
+        constexpr u32 intel_vendor_id = 0x8086;
+        const char* const no_float_atomics = std::getenv("EDEN_NX2_NO_FLOAT_ATOMICS");
+        extensions.shader_atomic_float =
+            extensions.shader_atomic_float &&
+            properties.properties.vendorID == intel_vendor_id &&
+            features.shader_atomic_float.shaderBufferFloat32AtomicAdd &&
+            !(no_float_atomics != nullptr && no_float_atomics[0] == '1');
+        RemoveExtensionFeatureIfUnsuitable(extensions.shader_atomic_float,
+                                           features.shader_atomic_float,
+                                           VK_EXT_SHADER_ATOMIC_FLOAT_EXTENSION_NAME);
+    }
+
     // VK_EXT_shader_demote_to_helper_invocation
     extensions.shader_demote_to_helper_invocation =
         features.shader_demote_to_helper_invocation.shaderDemoteToHelperInvocation;
@@ -1878,13 +1929,21 @@ void Device::RemoveUnsuitableExtensions() {
                                        features.vertex_input_dynamic_state,
                                        VK_EXT_VERTEX_INPUT_DYNAMIC_STATE_EXTENSION_NAME);
 
-    // VK_KHR_pipeline_executable_properties
-    if (Settings::values.renderer_shader_feedback.GetValue()) {
+    // VK_KHR_pipeline_executable_properties: with the shader feedback setting, or for
+    // EDEN_NX2_PIPELINE_STATS=<dir> (PipelineExecutableDump).
+    const char* const pipeline_stats_env{std::getenv("EDEN_NX2_PIPELINE_STATS")};
+    const bool pipeline_stats{pipeline_stats_env != nullptr && *pipeline_stats_env != '\0'};
+    if (Settings::values.renderer_shader_feedback.GetValue() || pipeline_stats) {
         extensions.pipeline_executable_properties =
             features.pipeline_executable_properties.pipelineExecutableInfo;
         RemoveExtensionFeatureIfUnsuitable(extensions.pipeline_executable_properties,
                                            features.pipeline_executable_properties,
                                            VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME);
+        if (pipeline_stats) {
+            LOG_INFO(Render_Vulkan,
+                     "EDEN_NX2_PIPELINE_STATS: VK_KHR_pipeline_executable_properties {}",
+                     extensions.pipeline_executable_properties ? "enabled" : "not available");
+        }
     } else {
         RemoveExtensionFeature(extensions.pipeline_executable_properties,
                                features.pipeline_executable_properties,
@@ -1894,8 +1953,20 @@ void Device::RemoveUnsuitableExtensions() {
     // VK_EXT_mesh_shader: Switch 2 titles draw some geometry with task and mesh programs. Only
     // the two stages are used; the multiview, shading rate and query features need more.
     features.mesh_shader.multiviewMeshShader = VK_FALSE;
-    features.mesh_shader.primitiveFragmentShadingRateMeshShader = VK_FALSE;
-    features.mesh_shader.meshShaderQueries = VK_FALSE;
+    // The shading rate one is kept for EDEN_NX2_MESH_OUT bit 2 with EDEN_NX2_VRS (see below).
+    const char* const mesh_out_env{std::getenv("EDEN_NX2_MESH_OUT")};
+    const bool mesh_primitive_rate{
+        std::getenv("EDEN_NX2_VRS") != nullptr && mesh_out_env != nullptr &&
+        (std::strtoul(mesh_out_env, nullptr, 0) & 2) != 0 &&
+        features.mesh_shader.primitiveFragmentShadingRateMeshShader &&
+        features.fragment_shading_rate.primitiveFragmentShadingRate};
+    if (!mesh_primitive_rate) {
+        features.mesh_shader.primitiveFragmentShadingRateMeshShader = VK_FALSE;
+    }
+    // Kept for EDEN_NX2_DRAW_STATS only.
+    if (std::getenv("EDEN_NX2_DRAW_STATS") == nullptr) {
+        features.mesh_shader.meshShaderQueries = VK_FALSE;
+    }
     extensions.mesh_shader = features.mesh_shader.taskShader && features.mesh_shader.meshShader;
     // EDEN_NX2_FORCE_MESH_FALLBACK=1: leave VK_EXT_mesh_shader disabled, so task/mesh draws take
     // the compute fallback a device without it uses.
@@ -1905,6 +1976,51 @@ void Device::RemoveUnsuitableExtensions() {
     }
     RemoveExtensionFeatureIfUnsuitable(extensions.mesh_shader, features.mesh_shader,
                                        VK_EXT_MESH_SHADER_EXTENSION_NAME);
+
+    // VK_KHR_fragment_shading_rate, only with EDEN_NX2_VRS: guest pipelines then take the rate
+    // as dynamic state (GraphicsPipeline). Only the per-draw rate is used, and the per-primitive
+    // rate of native mesh programs with EDEN_NX2_MESH_OUT bit 2.
+    if (!mesh_primitive_rate || !extensions.mesh_shader) {
+        features.fragment_shading_rate.primitiveFragmentShadingRate = VK_FALSE;
+    }
+    features.fragment_shading_rate.attachmentFragmentShadingRate = VK_FALSE;
+    extensions.fragment_shading_rate = extensions.fragment_shading_rate &&
+                                       features.fragment_shading_rate.pipelineFragmentShadingRate &&
+                                       instance_version >= VK_API_VERSION_1_2 &&
+                                       std::getenv("EDEN_NX2_VRS") != nullptr;
+    if (!extensions.fragment_shading_rate ||
+        !features.fragment_shading_rate.primitiveFragmentShadingRate) {
+        // The mesh feature needs the primitive rate one.
+        features.mesh_shader.primitiveFragmentShadingRateMeshShader = VK_FALSE;
+    }
+    if (mesh_primitive_rate) {
+        LOG_INFO(Render_Vulkan,
+                 "EDEN_NX2_MESH_OUT: per-primitive shading rate of mesh programs {} (multiple "
+                 "viewports {}, non-trivial combiners {})",
+                 IsMeshPrimitiveShadingRateSupported() ? "enabled" : "not available",
+                 properties.fragment_shading_rate.primitiveFragmentShadingRateWithMultipleViewports,
+                 properties.fragment_shading_rate.fragmentShadingRateNonTrivialCombinerOps);
+    }
+    fragment_shading_rates.clear();
+    if (extensions.fragment_shading_rate) {
+        std::string rates;
+        for (const VkPhysicalDeviceFragmentShadingRateKHR& rate :
+             physical.GetFragmentShadingRatesKHR()) {
+            if ((rate.sampleCounts & VK_SAMPLE_COUNT_1_BIT) == 0) {
+                continue;
+            }
+            fragment_shading_rates.push_back(rate.fragmentSize);
+            rates += fmt::format(" {}x{}", rate.fragmentSize.width, rate.fragmentSize.height);
+        }
+        const VkExtent2D max_size = properties.fragment_shading_rate.maxFragmentSize;
+        LOG_INFO(Render_Vulkan,
+                 "EDEN_NX2_VRS: VK_KHR_fragment_shading_rate enabled, rates:{}, max {}x{}", rates,
+                 max_size.width, max_size.height);
+    } else if (loaded_extensions.contains(VK_KHR_FRAGMENT_SHADING_RATE_EXTENSION_NAME)) {
+        // Not a warning: the extension is left out unless asked for.
+        RemoveExtensionFeature(extensions.fragment_shading_rate, features.fragment_shading_rate,
+                               VK_KHR_FRAGMENT_SHADING_RATE_EXTENSION_NAME);
+    }
 
     // VK_KHR_shader_quad_control
     // Quad control depends on maximal reconvergence; advertise neither unless
@@ -2205,7 +2321,7 @@ u64 Device::GetDeviceMemoryBudget() const {
         // An integrated GPU's device-local heap is system memory (a Radeon 780M reported a 21 GB
         // budget): following it let the texture cache fill that much RAM before collecting, and
         // kept ASTC uncompressed. Its budget is at most the share CollectPhysicalMemoryInfo
-        // gives it (4 GiB, 6 GiB with aggressive VRAM use).
+        // gives it (4 GiB, 6 GiB with aggressive VRAM use, or EDEN_NX2_IGPU_VRAM_MIB).
         result = (std::min)(result, device_access_memory);
     }
     return result;
@@ -2260,9 +2376,23 @@ void Device::CollectPhysicalMemoryInfo() {
         }
         device_access_memory += heap_size;
     }
+    main_heap_size = limit(mem_properties.memoryHeaps[main_heap].size);
     if (is_integrated) {
         const s64 available_memory = static_cast<s64>(device_access_memory - device_initial_usage);
-        const u64 memory_size = Settings::values.vram_usage_mode.GetValue() == Settings::VramUsageMode::Aggressive ? 6_GiB : 4_GiB;
+        u64 memory_size = Settings::values.vram_usage_mode.GetValue() == Settings::VramUsageMode::Aggressive ? 6_GiB : 4_GiB;
+        // EDEN_NX2_IGPU_VRAM_MIB=<n>: n MiB instead, still within what the heaps allow below.
+        if (const char* value = std::getenv("EDEN_NX2_IGPU_VRAM_MIB")) {
+            // At most 1 TiB, so the signed arithmetic below cannot overflow.
+            const u64 size = std::min<u64>(std::strtoull(value, nullptr, 10), 1u << 20) << 20;
+            if (size != 0) {
+                memory_size = size;
+                LOG_INFO(Render_Vulkan, "EDEN_NX2_IGPU_VRAM_MIB: integrated GPU share {} MiB",
+                         size >> 20);
+            } else {
+                LOG_WARNING(Render_Vulkan,
+                            "EDEN_NX2_IGPU_VRAM_MIB={} is not a size in MiB, ignored", value);
+            }
+        }
         device_access_memory = static_cast<u64>(std::max<s64>(std::min<s64>(available_memory - 8_GiB, memory_size), std::min<s64>(local_memory, memory_size)));
     } else {
         const u64 reserve_memory = std::min<u64>(device_access_memory / 8, 1_GiB);

@@ -32,11 +32,38 @@ constexpr u32 RESCALING_LAYOUT_WORDS_OFFSET = offsetof(RescalingLayout, rescalin
 constexpr u32 RESCALING_LAYOUT_DOWN_FACTOR_OFFSET = offsetof(RescalingLayout, down_factor);
 constexpr u32 RENDERAREA_LAYOUT_OFFSET = offsetof(RenderAreaLayout, render_area);
 
+/// Culling the epilogue of a native mesh program can add (Profile and RuntimeInfo mesh_cull).
+constexpr u32 MESH_CULL_FRUSTUM = 1; ///< triangles outside one of the x, y or w clip planes
+constexpr u32 MESH_CULL_SMALL = 2;   ///< triangles whose bounding box holds no pixel centre
+constexpr u32 MESH_CULL_EMPTY = 4;   ///< no outputs for a workgroup with no triangle left
+/// Push constant of the small triangle test: viewport 0 (x, y, width, height) in host pixels.
+/// It takes the last sizeof(RenderAreaLayout) bytes of the pipeline layout's range, which the
+/// render area (at offset 0) leaves unused.
+constexpr u32 MESH_CULL_VIEWPORT_OFFSET = sizeof(RescalingLayout);
+
+/// Cheaper outputs of a native mesh program (Profile and RuntimeInfo mesh_out).
+constexpr u32 MESH_OUT_DEAD = 1;   ///< no output for generic components the fragment stage never reads
+constexpr u32 MESH_OUT_RATE = 2;   ///< 2x2 shading rate for the triangles MESH_CULL_SMALL finds tiny
+constexpr u32 MESH_OUT_VECTOR = 8; ///< one store per output vector instead of one per component
+constexpr u32 MESH_OUT_COUNT = 16; ///< only as many vertices as the primitives use, not max_vertices
+
+/// Cheaper run-time routing of global memory accesses (Profile::global_memory_opt).
+constexpr u32 GM_HOIST = 1;  ///< buffer base addresses are computed once, at the start of main
+constexpr u32 GM_NARROW = 2; ///< a load searches only the buffers the storage buffer pass named
+/// 4 is reserved for rebasing single-pointer accesses at compile time (not implemented).
+constexpr u32 GM_NARROW_NO_FALLBACK = 8; ///< with GM_NARROW: zero, not the full search, below them
+
 [[nodiscard]] std::vector<u32> EmitSPIRV(const Profile& profile, const RuntimeInfo& runtime_info, IR::Program& program, Bindings& bindings);
 [[nodiscard]] inline std::vector<u32> EmitSPIRV(const Profile& profile, IR::Program& program) {
     Bindings binding;
     return EmitSPIRV(profile, {}, program, binding);
 }
+
+/// Whether EmitSPIRV gathers the program's software HMMA operands from subgroup scratch in shared
+/// memory (Profile::support_software_matrix_shared_memory). Its pipeline needs full subgroups of
+/// the guest's 32 lanes; this answers before the SPIR-V exists.
+[[nodiscard]] bool UsesSoftwareMatrixSharedMemory(const Profile& profile,
+                                                  const IR::Program& program);
 
 /// Words per lane in the buffer of EmitCooperativeHmmaTest: the guest registers a0 a1 a2 a3 b0 b1
 /// c0 c1 as input, then d0 d1 as output.
